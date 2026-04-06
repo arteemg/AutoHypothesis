@@ -1,0 +1,15 @@
+[project]
+name = "quant-autoagent"
+version = "0.1.0"
+description = "Single-file autonomous quant strategy search"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=0.40.0",
+    "yfinance>=0.2.40",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
