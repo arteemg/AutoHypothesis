@@ -47,7 +47,10 @@ It contains ONLY two functions — do not add anything else:
    "WHY: to see if it helps" is not valid. A WHY must name a specific
    mechanism — if you cannot name one, the experiment should not run.
 
-6. Read `last_result.json` for the score.
+6. Read `last_result.json` for the score. Also check `excess_sharpe` — a
+   result only counts as a genuine improvement if BOTH `score` AND
+   `excess_sharpe` improve. A rising score driven purely by bull-market
+   beta (excess_sharpe near zero or negative) is not real edge.
 
 7. If score improved: keep the change and increment your improvement counter.
    If not: revert `agent.py` to the previous version. Do not try a minor
@@ -57,7 +60,8 @@ It contains ONLY two functions — do not add anything else:
 8. **If improvement counter is a multiple of 5, you MUST run walk-forward
    before continuing:**
    - Run: `python agent.py --walk-forward --desc "CHANGE: <same as last kept change>. WF-CHECK: #N"`
-   - Read `last_result.json` — check `mean_oos_sharpe` and `pass`.
+   - Read `last_result.json` — check `mean_oos_sharpe`, `mean_excess_sharpe`,
+     and `pass`.
    - If `pass` is `false`: revert to the previous best. Ask whether the
      underlying inefficiency hypothesis is still convincing given the OOS
      evidence. If the same hypothesis has failed walk-forward twice, abandon
@@ -68,8 +72,11 @@ It contains ONLY two functions — do not add anything else:
 
 ## Walk-Forward Rule
 
-Every 3 successful improvements, run walk-forward manually.
-If mean OOS Sharpe < 0.8, revert to a more conservative version.
+Every 5 successful improvements, run walk-forward.
+Walk-forward tests on the locked 2019–2021 window (3 expanding folds) —
+this period is never seen during in-sample optimisation.
+If mean OOS Sharpe < 0.8 OR mean excess Sharpe <= 0, revert to a more
+conservative version.
 If the same hypothesis fails walk-forward twice in a row, it is overfit —
 discard it and start from a new hypothesis.
 
@@ -84,12 +91,25 @@ discard it and start from a new hypothesis.
 ## Research Directive
 
 **Asset class:** US equities (S&P 500 universe)  
-**Data:** Daily OHLCV, 2010–2022 in-sample, 2023 holdout (never look at this)  
-**Universe:** Top 150 stocks by 30-day average dollar volume
+**Data:** Daily OHLCV — see split below
+**Universe:** Top 150 stocks by 30-day average dollar volume (selected from
+in-sample data only — future liquidity does not influence universe choice)
+**In-sample:** 2010–2018 (~2,270 trading days, includes GFC tail, EU debt crisis, 2015 oil crash)
+**Walk-forward:** 2019–2021 (3 expanding folds, includes 2019 bull, COVID crash and recovery)
+**Holdout:** 2022–2024 (rates shock + AI rally — locked until final run)
+
+**Data split (fixed — do not change):**
+
+```
+2010 ──────────────── 2018 | 2019 ──────── 2021 | 2022 ──── 2024
+      IN-SAMPLE              WALK-FORWARD          HOLDOUT
+   (optimise here only)     (test only, 3 folds)   (locked)
+```
 
 **Target metrics:**
 
 - Sharpe ratio > 1.2 (annualized, after 10bps transaction costs)
+- Excess Sharpe > 0.3 over equal-weight buy-and-hold of the same universe
 - Max drawdown < 25%
 - Monthly turnover < 50%
 - Long-only (no shorting)
@@ -100,6 +120,13 @@ discard it and start from a new hypothesis.
 score = sharpe
       - max(0, (turnover - 0.3) * 0.5)       # penalize high turnover
       - max(0, (|max_drawdown| - 0.20) * 2)  # penalize deep drawdowns
+```
+
+**Walk-forward pass criteria (both must hold):**
+
+```
+mean_oos_sharpe    >= 0.8
+mean_excess_sharpe >  0.0   (strategy must beat equal-weight benchmark)
 ```
 
 **Hypothesis space — explore roughly in this order:**
@@ -127,6 +154,7 @@ score = sharpe
 - Very short lookbacks on individual signals (< 5 days)
 - Too many simultaneous parameter changes
 - Strategies that only work in one regime (pure bull-market momentum)
+- High score with near-zero excess_sharpe (benchmark doing the work)
 
 ## How to Run
 
@@ -138,10 +166,10 @@ pip install -e .
 python agent.py --in-sample --desc "baseline: 12-1 momentum + SPY 200d regime"
 
 # After editing the editable section, run a backtest
-python agent.py --in-sample --desc "added inverse vol weighting to position sizes"
+python agent.py --in-sample --desc "CHANGE: added inverse vol weighting. WHY: reduces exposure to high-vol stocks before drawdowns."
 
 # Run walk-forward validation (every 5 improvements)
-python agent.py --walk-forward --desc "walk-forward check after vol scaling"
+python agent.py --walk-forward --desc "CHANGE: <same as last kept>. WF-CHECK: #1"
 
 # Final holdout eval (only once, at the end)
 python agent.py --holdout --desc "final holdout: best strategy"

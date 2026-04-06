@@ -6,8 +6,16 @@ The fixed section below handles data loading, simulation, scoring, and walk-forw
 
 Run:
   python agent.py                  # single in-sample backtest
-  python agent.py --walk-forward   # 5-fold walk-forward validation
-  python agent.py --holdout        # final holdout eval (Do not use! Only for final sanity check run by a human.)
+  python agent.py --walk-forward   # expanding walk-forward on 2019-2021
+  python agent.py --holdout        # final holdout eval (run once, at the very end)
+
+Features:
+  1. Point-in-time universe  — universe selected from IS dollar volume only.
+  2. Explicit three-way split — IS (2010-2018), WF (2019-2021), holdout (2022+).
+  3. Walk-forward       — expanding training window; test folds are
+     strictly inside the WF period, never touching IS or holdout.
+  4. Benchmark tracking      — every result logs excess_sharpe vs equal-weight
+     buy-and-hold of the same universe over the same period.
 """
 
 from __future__ import annotations
@@ -16,10 +24,9 @@ import argparse
 import importlib
 import sys
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import pickle
-from datetime import timedelta
 
 import pandas as pd
 import numpy as np
@@ -41,14 +48,14 @@ def get_signals(data: dict) -> pd.DataFrame:
         pd.DataFrame[bool] — True means long this stock today
     """
     close = data["close"]
-    spy = data["spy"].squeeze()        # DataFrame (N×1) → Series (N,)
+    spy = data["spy"].squeeze()   # DataFrame (N×1) → Series (N,)
 
     # 12-1 momentum: 12-month return, skip most recent month
     momentum = close.pct_change(252).shift(21)
 
     # Market regime: only long when SPY is above its 200-day MA
     spy_200d = spy.rolling(200).mean()
-    in_bull_market = (spy > spy_200d)    # boolean Series
+    in_bull_market = spy > spy_200d
 
     # Take top 10% by momentum score
     ranked = momentum.rank(axis=1, pct=True)
@@ -79,15 +86,26 @@ def get_position_sizes(signals: pd.DataFrame, data: dict) -> pd.DataFrame:
 # FIXED ADAPTER BOUNDARY — do not modify below this line
 # ============================================================================
 
-
 warnings.filterwarnings("ignore")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
+# Do not change — altering any of these invalidates cross-experiment comparison.
 
-# fixed — do not change, invalidates cross-experiment comparison
 UNIVERSE_SIZE = 150
-TRAIN_END = "2022-12-31"
-HOLDOUT_START = "2023-01-01"
+
+# In-sample: the only period the meta-agent ever optimises against
+IS_START = "2010-01-01"
+IS_END = "2018-12-31"
+
+# Walk-forward: test folds are drawn exclusively from this window
+WF_START = "2019-01-01"
+WF_END = "2021-12-31"
+
+# Kept for legacy CLI compatibility — equals WF_END
+TRAIN_END = WF_END
+
+# Holdout: never touched until the single final run
+HOLDOUT_START = "2022-01-01"
 
 TRANSACTION_COST = 0.0010
 ROOT = Path(__file__).parent
@@ -130,6 +148,10 @@ def _cache_fresh() -> bool:
 
 def load_data(start: str = "2009-01-01", end: str = "2025-12-31",
               force: bool = False) -> dict:
+    """
+    Load raw OHLCV for the full ticker list.
+    Universe selection happens later in select_universe() using only IS data.
+    """
     if not force and _cache_fresh():
         print("Loading from cache...")
         with open(CACHE_FILE, "rb") as f:
@@ -160,41 +182,91 @@ def load_data(start: str = "2009-01-01", end: str = "2025-12-31",
     low = low[valid].ffill()
     volume = volume[valid].ffill()
 
-    dv = (close * volume).rolling(30).mean()
-    non_spy = [t for t in valid if t != "SPY"]
-    top_n = dv[non_spy].mean().nlargest(UNIVERSE_SIZE).index.tolist()
-    universe = top_n + ["SPY"]
-
-    close = close[universe]
-    high = high[universe]
-    low = low[universe]
-    volume = volume[universe]
-
-    tradeable = [t for t in universe if t != "SPY"]
     data = {
-        "close":   close[tradeable],
-        "high":    high[tradeable],
-        "low":     low[tradeable],
-        "volume":  volume[tradeable],
+        "close":   close,
+        "high":    high,
+        "low":     low,
+        "volume":  volume,
         "spy":     close[["SPY"]],
-        "tickers": tradeable,
+        "tickers": [t for t in valid if t != "SPY"],
     }
 
     with open(CACHE_FILE, "wb") as f:
         pickle.dump(data, f)
 
-    print(f"Cached {len(tradeable)} tickers.")
+    print(f"Cached {len(valid)} tickers (including SPY).")
     return data
 
 
-def split_data(data: dict, train_end: str) -> tuple[dict, dict]:
-    def _before(df): return df[df.index <= train_end]
-    def _after(df): return df[df.index > train_end]
-    train = {k: _before(v) if isinstance(v, pd.DataFrame)
-             else v for k, v in data.items()}
-    holdout = {k: _after(v) if isinstance(v, pd.DataFrame)
-               else v for k, v in data.items()}
-    return train, holdout
+# ── Universe & split helpers ──────────────────────────────────────────────────
+
+def _slice(df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
+    return df[(df.index >= start) & (df.index <= end)]
+
+
+def select_universe(raw: dict) -> dict:
+    """
+    Point-in-time universe selection.
+
+    Universe is chosen by average 30-day dollar volume computed using
+    in-sample data only (2010–2018). Future liquidity figures never
+    influence which stocks appear in the training universe.
+
+    The full time series for the selected tickers is returned — the
+    selection criterion used only IS data, but all periods remain
+    available for later slicing into IS / WF / holdout.
+    """
+    is_close = _slice(raw["close"],  IS_START, IS_END)
+    is_volume = _slice(raw["volume"], IS_START, IS_END)
+
+    dv = (is_close * is_volume).rolling(30).mean()
+    non_spy = [t for t in is_close.columns if t != "SPY"]
+    top_n = dv[non_spy].mean().nlargest(UNIVERSE_SIZE).index.tolist()
+    universe = top_n + ["SPY"]
+
+    tradeable = [t for t in universe if t != "SPY"]
+    return {
+        "close":   raw["close"][tradeable],
+        "high":    raw["high"][tradeable],
+        "low":     raw["low"][tradeable],
+        "volume":  raw["volume"][tradeable],
+        "spy":     raw["spy"],
+        "tickers": tradeable,
+    }
+
+
+def three_way_split(data: dict) -> tuple[dict, dict, dict]:
+    """
+    Explicit three-way split.
+
+    Returns:
+        insample — 2010-01-01 → 2018-12-31  (meta-agent optimises here only)
+        wf       — 2019-01-01 → 2021-12-31  (walk-forward test territory)
+        holdout  — 2022-01-01 → ...          (locked until the very final run)
+    """
+    def _make(start, end):
+        return {
+            k: _slice(v, start, end) if isinstance(v, pd.DataFrame) else v
+            for k, v in data.items()
+        }
+
+    insample = _make(IS_START,      IS_END)
+    wf = _make(WF_START,      WF_END)
+    holdout = _make(HOLDOUT_START, "2099-12-31")
+    return insample, wf, holdout
+
+
+# ── Benchmark ─────────────────────────────────────────────────────────────────
+
+def benchmark_returns(data: dict) -> pd.Series:
+    """Equal-weight buy-and-hold of all tradeable tickers in `data`."""
+    return data["close"].pct_change().fillna(0.0).mean(axis=1)
+
+
+def benchmark_sharpe(returns: pd.Series) -> float:
+    ann_ret = returns.mean() * 252
+    ann_vol = returns.std() * np.sqrt(252)
+    return round(ann_ret / ann_vol, 4) if ann_vol > 0 else 0.0
 
 
 # ── Simulation ────────────────────────────────────────────────────────────────
@@ -216,10 +288,12 @@ def simulate(data: dict, signals_fn, sizes_fn) -> tuple[pd.Series, pd.DataFrame]
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
 
-def compute_metrics(returns: pd.Series, weights: pd.DataFrame) -> dict:
+def compute_metrics(returns: pd.Series, weights: pd.DataFrame,
+                    bm_sharpe: float = 0.0) -> dict:
     if returns.empty or returns.std() == 0:
         return {"sharpe": 0, "max_drawdown": 0, "annual_return": 0,
-                "turnover": 0, "score": 0}
+                "turnover": 0, "score": 0, "excess_sharpe": 0,
+                "benchmark_sharpe": bm_sharpe}
 
     ann_ret = returns.mean() * 252
     ann_vol = returns.std() * np.sqrt(252)
@@ -236,45 +310,100 @@ def compute_metrics(returns: pd.Series, weights: pd.DataFrame) -> dict:
              - max(0, (abs(max_drawdown) - 0.20) * 2))
 
     return {
-        "sharpe":        round(sharpe, 4),
-        "max_drawdown":  round(max_drawdown, 4),
-        "annual_return": round(ann_ret, 4),
-        "turnover":      round(turnover, 4),
-        "score":         round(score, 4),
-        "n_days":        len(returns),
+        "sharpe":           round(sharpe, 4),
+        "max_drawdown":     round(max_drawdown, 4),
+        "annual_return":    round(ann_ret, 4),
+        "turnover":         round(turnover, 4),
+        "score":            round(score, 4),
+        "benchmark_sharpe": round(bm_sharpe, 4),
+        "excess_sharpe":    round(sharpe - bm_sharpe, 4),
+        "n_days":           len(returns),
     }
 
 
 # ── Walk-forward ──────────────────────────────────────────────────────────────
 
-def walk_forward(data: dict, signals_fn, sizes_fn, n_folds: int = 5) -> dict:
-    dates = data["close"].index
-    fold_days = len(dates) // (n_folds + 1)
+def walk_forward(insample: dict, wf: dict, signals_fn, sizes_fn,
+                 n_folds: int = 3) -> dict:
+    wf_dates = wf["close"].index
+    n_wf_days = len(wf_dates)
+    fold_days = n_wf_days // n_folds
     folds = []
 
     for i in range(n_folds):
-        test_start = fold_days * (i + 1)
-        test_end = min(test_start + fold_days, len(dates) - 1)
-        test_dates = dates[test_start:test_end]
+        test_start_idx = i * fold_days
+        test_end_idx = (i + 1) * fold_days if i < n_folds - 1 else n_wf_days
+        test_dates = wf_dates[test_start_idx:test_end_idx]
+        # WF rows seen before this fold
+        wf_seen_dates = wf_dates[:test_start_idx]
 
-        slice_data = {k: v[v.index.isin(test_dates)] if isinstance(v, pd.DataFrame) else v
-                      for k, v in data.items()}
+        # Build context: IS history + any WF rows before the test window
+        def _build(key):
+            parts = [insample[key]]
+            if len(wf_seen_dates) > 0:
+                parts.append(wf[key][wf[key].index.isin(wf_seen_dates)])
+            return pd.concat(parts).sort_index()
+
+        # Extend context through the test window so signals can be computed
+        # on test dates (rolling windows need the preceding rows)
+        def _full(key):
+            return pd.concat([
+                _build(key),
+                wf[key][wf[key].index.isin(test_dates)],
+            ]).sort_index()
+
+        full_ctx = {
+            "close":   _full("close"),
+            "high":    _full("high"),
+            "low":     _full("low"),
+            "volume":  _full("volume"),
+            "spy":     _full("spy"),
+            "tickers": insample["tickers"],
+        }
+
         try:
-            returns, weights = simulate(slice_data, signals_fn, sizes_fn)
-            m = compute_metrics(returns, weights)
+            ret_full, wgt_full = simulate(full_ctx, signals_fn, sizes_fn)
+
+            # Evaluate on test dates only — this is the genuine OOS result
+            ret_test = ret_full[ret_full.index.isin(test_dates)]
+            wgt_test = wgt_full[wgt_full.index.isin(test_dates)]
+
+            bm_full = benchmark_returns(full_ctx)
+            bm_test = bm_full[bm_full.index.isin(test_dates)]
+            bm_shr = benchmark_sharpe(bm_test)
+
+            m = compute_metrics(ret_test, wgt_test, bm_sharpe=bm_shr)
             m["fold"] = i + 1
+            m["train_days"] = len(insample["close"]) + len(wf_seen_dates)
+            m["test_days"] = len(test_dates)
             m["period"] = f"{test_dates[0].date()} → {test_dates[-1].date()}"
+            m["train_end"] = (str(wf_seen_dates[-1].date())
+                              if len(wf_seen_dates) else
+                              str(insample["close"].index[-1].date()))
+
         except Exception as e:
-            m = {"fold": i + 1, "error": str(e), "sharpe": 0, "score": 0}
+            m = {"fold": i + 1, "error": str(e), "sharpe": 0,
+                 "score": 0, "excess_sharpe": 0}
+
         folds.append(m)
+        print(f"  Fold {i + 1}/{n_folds}: {m.get('period', '')}  "
+              f"sharpe={m.get('sharpe', 0):.3f}  "
+              f"excess={m.get('excess_sharpe', 0):+.3f}")
 
     sharpes = [f["sharpe"] for f in folds if "sharpe" in f]
+    excess_sharpes = [f["excess_sharpe"]
+                      for f in folds if "excess_sharpe" in f]
+
     return {
-        "type":            "walk_forward",
-        "folds":           folds,
-        "mean_oos_sharpe": round(np.mean(sharpes), 4) if sharpes else 0,
-        "std_oos_sharpe":  round(np.std(sharpes), 4) if sharpes else 0,
-        "pass":            bool(np.mean(sharpes) >= 0.8) if sharpes else False,
+        "type":               "walk_forward",
+        "folds":              folds,
+        "mean_oos_sharpe":    round(np.mean(sharpes),        4) if sharpes else 0,
+        "std_oos_sharpe":     round(np.std(sharpes),         4) if sharpes else 0,
+        "mean_excess_sharpe": round(np.mean(excess_sharpes), 4) if excess_sharpes else 0,
+        # pass = Sharpe threshold AND beating the equal-weight benchmark
+        "pass": bool(
+            np.mean(sharpes) >= 0.8 and np.mean(excess_sharpes) > 0.0
+        ) if sharpes else False,
     }
 
 
@@ -282,11 +411,14 @@ def walk_forward(data: dict, signals_fn, sizes_fn, n_folds: int = 5) -> dict:
 
 def _log_result(result: dict, mode: str, description: str = "") -> None:
     import csv
-    # For walk-forward, metrics live under result["in_sample"]; append OOS summary to desc
+
     if mode == "walk_forward":
         metrics = result.get("in_sample", {})
-        oos_note = (f"[OOS sharpe={result.get('mean_oos_sharpe', '')} "
-                    f"pass={result.get('pass', '')}]")
+        oos_note = (
+            f"[OOS sharpe={result.get('mean_oos_sharpe', '')} "
+            f"excess={result.get('mean_excess_sharpe', '')} "
+            f"pass={result.get('pass', '')}]"
+        )
         description = f"{oos_note} {description}".strip()
     else:
         metrics = result
@@ -296,8 +428,10 @@ def _log_result(result: dict, mode: str, description: str = "") -> None:
         writer = csv.writer(f)
         if write_header:
             writer.writerow([
-                "timestamp", "mode", "sharpe", "max_drawdown",
-                "annual_return", "turnover", "score", "description",
+                "timestamp", "mode",
+                "sharpe", "max_drawdown", "annual_return", "turnover", "score",
+                "benchmark_sharpe", "excess_sharpe",
+                "description",
             ])
         writer.writerow([
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -306,7 +440,9 @@ def _log_result(result: dict, mode: str, description: str = "") -> None:
             metrics.get("max_drawdown", ""),
             metrics.get("annual_return", ""),
             metrics.get("turnover", ""),
-            metrics.get("score", ""),
+            metrics.get("score", "") or "",
+            metrics.get("benchmark_sharpe", ""),
+            metrics.get("excess_sharpe", ""),
             description,
         ])
 
@@ -323,25 +459,30 @@ def run_once(mode: str = "in_sample", description: str = "") -> dict:
     signals_fn = mod.get_signals
     sizes_fn = mod.get_position_sizes
 
-    all_data = load_data()
-    train, holdout = split_data(all_data, TRAIN_END)
+    raw_data = load_data()
+    pit_data = select_universe(raw_data)        # FIX 1
+    insample, wf, holdout = three_way_split(pit_data)        # FIX 2
 
     if mode == "holdout":
-        print("⚠️  HOLDOUT eval")
+        print("⚠️  HOLDOUT eval — do not iterate after this.")
         returns, weights = simulate(holdout, signals_fn, sizes_fn)
-        result = compute_metrics(returns, weights)
+        bm_shr = benchmark_sharpe(benchmark_returns(holdout))
+        result = compute_metrics(returns, weights, bm_sharpe=bm_shr)
         result["type"] = "holdout"
 
     elif mode == "walk_forward":
-        print("Running walk-forward validation...")
-        result = walk_forward(train, signals_fn, sizes_fn)
-        returns, weights = simulate(train, signals_fn, sizes_fn)
-        result["in_sample"] = compute_metrics(returns, weights)
+        print("Running walk-forward (2019–2021, 3 folds)...")
+        result = walk_forward(insample, wf, signals_fn, sizes_fn)  # FIX 3
+        returns, weights = simulate(insample, signals_fn, sizes_fn)
+        bm_shr = benchmark_sharpe(benchmark_returns(insample))
+        result["in_sample"] = compute_metrics(
+            returns, weights, bm_sharpe=bm_shr)
 
     else:
-        print("Running in-sample backtest...")
-        returns, weights = simulate(train, signals_fn, sizes_fn)
-        result = compute_metrics(returns, weights)
+        print("Running in-sample backtest (2010–2018)...")
+        returns, weights = simulate(insample, signals_fn, sizes_fn)
+        bm_shr = benchmark_sharpe(benchmark_returns(insample))
+        result = compute_metrics(returns, weights, bm_sharpe=bm_shr)
         result["type"] = "in_sample"
 
     LAST_RESULT.write_text(json.dumps(result, indent=2))
@@ -356,7 +497,7 @@ if __name__ == "__main__":
     parser.add_argument("--walk-forward", action="store_true")
     parser.add_argument("--holdout",      action="store_true")
     parser.add_argument("--in-sample",    action="store_true")
-    parser.add_argument("--desc",         default="",
+    parser.add_argument("--desc", default="",
                         help="Short description logged to results.csv")
     args = parser.parse_args()
 
