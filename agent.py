@@ -28,7 +28,6 @@ import numpy as np
 # ============================================================================
 # EDITABLE HARNESS — meta-agent modifies this section
 # ============================================================================
-# classic 12-1 cross-sectional momentum from Jegadeesh & Titman (1993) combined with a SPY 200-day MA regime filter.
 
 def get_signals(data: dict) -> pd.DataFrame:
     """

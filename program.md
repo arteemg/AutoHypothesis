@@ -14,24 +14,64 @@ It contains ONLY two functions — do not add anything else:
 
 ## Experiment Loop
 
-1. Read the current editable section of `agent.py`
-2. Read `results.csv` to understand what has been tried and what failed
-3. Propose ONE focused change — explain your reasoning
-4. Rewrite the editable section of `agent.py` with the new strategy
-5. Run the backtest with a short description of the change
-6. Read `last_result.json` for the score
-7. If score improved: keep the change and increment your improvement counter. If not: revert `agent.py` to the previous version
-8. **If improvement counter is a multiple of 5, you MUST run walk-forward before continuing:**
-   - Run `python agent.py --walk-forward --desc "walk-forward check #N"`
-   - Read `last_result.json` — check `mean_oos_sharpe` and `pass`
-   - If `pass` is `false`: revert to the previous best, increment walk-forward failure counter, and try a more conservative version next
-   - If `pass` is `true`: reset walk-forward failure counter and continue
-9. Repeat
+1. Read the current editable section of `agent.py`.
+
+2. Read `results.csv` to understand what has been tried and what failed.
+   - Inspect the INEFFICIENCY field of every past `--desc` entry.
+   - Do not repeat an approach unless you have a genuinely new economic
+     justification. Parameter sweeps (e.g. "try 93rd pct instead of 95th")
+     with no new rationale are forbidden.
+
+3. Propose ONE focused change. Before writing any code, write a rationale
+   using this exact format:
+
+   **CHANGE:** One sentence on what you are changing.  
+   **WHY:** One sentence on why it should improve the score — name a specific
+   mechanism. "To see if it helps" is not valid.
+
+   If you cannot write a convincing WHY, do not run the experiment.
+   Move to the next hypothesis in the hypothesis space instead.
+
+4. Rewrite the editable section of `agent.py` with the new strategy.
+   Change ONE thing at a time. If more than ~10 lines change, you are likely
+   making a compound change — split it into separate experiments.
+
+5. Run the backtest. The `--desc` argument is mandatory and must follow this
+   structure exactly (keep each sentence under 100 characters):
+
+   ```
+   python agent.py --in-sample --desc "CHANGE: <what you are changing>. WHY: <why it should improve the score>."
+   ```
+
+   Do NOT run the experiment if you cannot write a honest WHY sentence.
+   "WHY: to see if it helps" is not valid. A WHY must name a specific
+   mechanism — if you cannot name one, the experiment should not run.
+
+6. Read `last_result.json` for the score.
+
+7. If score improved: keep the change and increment your improvement counter.
+   If not: revert `agent.py` to the previous version. Do not try a minor
+   variation of the same idea without a new economic justification — a failed
+   hypothesis is a failed hypothesis.
+
+8. **If improvement counter is a multiple of 5, you MUST run walk-forward
+   before continuing:**
+   - Run: `python agent.py --walk-forward --desc "CHANGE: <same as last kept change>. WF-CHECK: #N"`
+   - Read `last_result.json` — check `mean_oos_sharpe` and `pass`.
+   - If `pass` is `false`: revert to the previous best. Ask whether the
+     underlying inefficiency hypothesis is still convincing given the OOS
+     evidence. If the same hypothesis has failed walk-forward twice, abandon
+     it entirely and move to a new one from the hypothesis space below.
+   - If `pass` is `true`: reset walk-forward failure counter and continue.
+
+9. Repeat until a stopping criterion is met.
 
 ## Walk-Forward Rule
 
 Every 5 successful improvements, run walk-forward manually.
 If mean OOS Sharpe < 0.8, revert to a more conservative version.
+If the same hypothesis fails walk-forward twice in a row, it is overfit —
+discard it and start from a new hypothesis.
 
 ## Stopping Criteria
 
