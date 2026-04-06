@@ -7,7 +7,7 @@ The fixed section below handles data loading, simulation, scoring, and walk-forw
 Run:
   python agent.py                  # single in-sample backtest
   python agent.py --walk-forward   # 5-fold walk-forward validation
-  python agent.py --holdout        # final holdout eval (use sparingly)
+  python agent.py --holdout        # final holdout eval (Do not use! Only for final sanity check run by a human.)
 """
 
 from __future__ import annotations
@@ -28,21 +28,51 @@ import numpy as np
 # ============================================================================
 # EDITABLE HARNESS — meta-agent modifies this section
 # ============================================================================
+# classic 12-1 cross-sectional momentum from Jegadeesh & Titman (1993) combined with a SPY 200-day MA regime filter.
 
-def get_signals(data):
+def get_signals(data: dict) -> pd.DataFrame:
+    """
+    Generate entry signals.
+
+    Args:
+        data: dict with keys close, high, low, volume, spy
+              all pd.DataFrame with shape (dates, tickers)
+
+    Returns:
+        pd.DataFrame[bool] — True means long this stock today
+    """
     close = data["close"]
-    spy = data["spy"].squeeze()
+    spy = data["spy"].squeeze()        # DataFrame (N×1) → Series (N,)
 
+    # 12-1 momentum: 12-month return, skip most recent month
     momentum = close.pct_change(252).shift(21)
-    in_bull_market = spy > spy.rolling(200).mean()
-    signals = (momentum.rank(axis=1, pct=True) >
-               0.90) & in_bull_market.values.reshape(-1, 1)
+
+    # Market regime: only long when SPY is above its 200-day MA
+    spy_200d = spy.rolling(200).mean()
+    in_bull_market = (spy > spy_200d)    # boolean Series
+
+    # Take top 10% by momentum score
+    ranked = momentum.rank(axis=1, pct=True)
+    top_momentum = ranked > 0.90
+
+    signals = top_momentum & in_bull_market.values.reshape(-1, 1)
     return signals.fillna(False)
 
 
-def get_position_sizes(signals, data):
-    n = signals.sum(axis=1).replace(0, np.nan)
-    weights = signals.astype(float).div(n, axis=0).fillna(0.0)
+def get_position_sizes(signals: pd.DataFrame, data: dict) -> pd.DataFrame:
+    """
+    Convert signals to portfolio weights.
+
+    Args:
+        signals: boolean DataFrame from get_signals()
+        data:    same data dict
+
+    Returns:
+        pd.DataFrame[float] — portfolio weights, rows must sum to <= 1.0
+    """
+    # Equal weight among selected stocks
+    n_selected = signals.sum(axis=1).replace(0, np.nan)
+    weights = signals.astype(float).div(n_selected, axis=0).fillna(0.0)
     return weights
 
 
@@ -64,7 +94,7 @@ TRANSACTION_COST = 0.0010
 ROOT = Path(__file__).parent
 DATA_DIR = ROOT / "data"
 AGENT_DIR = ROOT / ".agent"
-RESULTS_TSV = ROOT / "results.tsv"
+RESULTS_CSV = ROOT / "results.csv"
 LAST_RESULT = ROOT / "last_result.json"
 DATA_DIR.mkdir(exist_ok=True)
 AGENT_DIR.mkdir(exist_ok=True)
@@ -199,7 +229,7 @@ def compute_metrics(returns: pd.Series, weights: pd.DataFrame) -> dict:
     cum = (1 + returns).cumprod()
     max_drawdown = ((cum - cum.cummax()) / cum.cummax()).min()
 
-    monthly_w = weights.resample("M").last()
+    monthly_w = weights.resample("ME").last()
     turnover = monthly_w.diff().abs().sum(axis=1).mean()
 
     score = (sharpe
@@ -249,9 +279,42 @@ def walk_forward(data: dict, signals_fn, sizes_fn, n_folds: int = 5) -> dict:
     }
 
 
+# ── Results logging ───────────────────────────────────────────────────────────
+
+def _log_result(result: dict, mode: str, description: str = "") -> None:
+    import csv
+    # For walk-forward, metrics live under result["in_sample"]; append OOS summary to desc
+    if mode == "walk_forward":
+        metrics = result.get("in_sample", {})
+        oos_note = (f"[OOS sharpe={result.get('mean_oos_sharpe', '')} "
+                    f"pass={result.get('pass', '')}]")
+        description = f"{oos_note} {description}".strip()
+    else:
+        metrics = result
+
+    write_header = not RESULTS_CSV.exists()
+    with open(RESULTS_CSV, "a", newline="") as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow([
+                "timestamp", "mode", "sharpe", "max_drawdown",
+                "annual_return", "turnover", "score", "description",
+            ])
+        writer.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            mode,
+            metrics.get("sharpe", ""),
+            metrics.get("max_drawdown", ""),
+            metrics.get("annual_return", ""),
+            metrics.get("turnover", ""),
+            metrics.get("score", ""),
+            description,
+        ])
+
+
 # ── Single-run entry point ────────────────────────────────────────────────────
 
-def run_once(mode: str = "in_sample") -> dict:
+def run_once(mode: str = "in_sample", description: str = "") -> dict:
     mod_name = Path(__file__).stem
     if mod_name in sys.modules:
         mod = importlib.reload(sys.modules[mod_name])
@@ -283,6 +346,7 @@ def run_once(mode: str = "in_sample") -> dict:
         result["type"] = "in_sample"
 
     LAST_RESULT.write_text(json.dumps(result, indent=2))
+    _log_result(result, mode, description)
     return result
 
 
@@ -293,11 +357,13 @@ if __name__ == "__main__":
     parser.add_argument("--walk-forward", action="store_true")
     parser.add_argument("--holdout",      action="store_true")
     parser.add_argument("--in-sample",    action="store_true")
+    parser.add_argument("--desc",         default="",
+                        help="Short description logged to results.csv")
     args = parser.parse_args()
 
     if args.holdout:
-        print(json.dumps(run_once("holdout"), indent=2))
+        print(json.dumps(run_once("holdout", args.desc), indent=2))
     elif args.walk_forward:
-        print(json.dumps(run_once("walk_forward"), indent=2))
+        print(json.dumps(run_once("walk_forward", args.desc), indent=2))
     else:
-        print(json.dumps(run_once("in_sample"), indent=2))
+        print(json.dumps(run_once("in_sample", args.desc), indent=2))

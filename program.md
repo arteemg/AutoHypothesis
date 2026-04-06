@@ -15,17 +15,19 @@ It contains ONLY two functions — do not add anything else:
 ## Experiment Loop
 
 1. Read the current editable section of `agent.py`
-2. Read `results.tsv` to understand what has been tried and what failed
-3. Propose ONE focused change — explain your reasoning before the code
-4. Output the COMPLETE replacement editable section in a ```python block
-5. The harness will apply it, run the backtest, and report back
-6. If score improved: change is kept. If not: change is reverted automatically.
-7. Repeat.
+2. Read `results.csv` to understand what has been tried and what failed
+3. Propose ONE focused change — explain your reasoning
+4. Rewrite the editable section of `agent.py` with the new strategy
+5. Run the backtest with a short description of the change
+6. Read `last_result.json` for the score
+7. If score improved: keep the change. If not: revert `agent.py` to the previous version
+8. Every 5 successful improvements, run walk-forward validation
+9. Repeat
 
 ## Walk-Forward Rule
 
-Every 5 successful improvements, a walk-forward validation runs automatically.
-If the strategy fails (mean OOS Sharpe < 0.8), try a more robust/conservative version.
+Every 5 successful improvements, run walk-forward manually.
+If mean OOS Sharpe < 0.8, revert to a more conservative version.
 
 ## Stopping Criteria
 
@@ -33,17 +35,12 @@ If the strategy fails (mean OOS Sharpe < 0.8), try a more robust/conservative ve
 - 50 iterations — time limit
 - 3 consecutive walk-forward failures — likely overfit, stop
 
-## NEVER STOP
-
-Once the loop begins, do NOT stop to ask whether to continue.
-Keep iterating until a stopping criterion is met or the human interrupts.
-
 ---
 
 ## Research Directive
 
-**Asset class:** US equities (S&P 500 universe)
-**Data:** Daily OHLCV, 2010–2022 in-sample, 2023 holdout (never look at this)
+**Asset class:** US equities (S&P 500 universe)  
+**Data:** Daily OHLCV, 2010–2022 in-sample, 2023 holdout (never look at this)  
 **Universe:** Top 150 stocks by 30-day average dollar volume
 
 **Target metrics:**
@@ -93,15 +90,15 @@ score = sharpe
 # Install deps
 pip install -e .
 
-# Set API key
-export ANTHROPIC_API_KEY=sk-ant-...
+# Establish baseline (first run, no changes)
+python agent.py --in-sample --desc "baseline: 12-1 momentum + SPY 200d regime"
 
-# Pre-fetch data (recommended)
-python agent.py --in-sample
+# After editing the editable section, run a backtest
+python agent.py --in-sample --desc "added inverse vol weighting to position sizes"
 
-# Run the meta-agent loop
-python agent.py --loop 50
+# Run walk-forward validation (every 5 improvements)
+python agent.py --walk-forward --desc "walk-forward check after vol scaling"
 
 # Final holdout eval (only once, at the end)
-python agent.py --holdout
+python agent.py --holdout --desc "final holdout: best strategy"
 ```
