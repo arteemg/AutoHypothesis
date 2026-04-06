@@ -8,11 +8,10 @@ Run:
   python agent.py                  # single in-sample backtest
   python agent.py --walk-forward   # expanding walk-forward on 2019-2021
   python agent.py --holdout        # final holdout eval (run once, at the very end)
-
-Features:
+  
   1. Point-in-time universe  — universe selected from IS dollar volume only.
   2. Explicit three-way split — IS (2010-2018), WF (2019-2021), holdout (2022+).
-  3. Walk-forward       — expanding training window; test folds are
+  3. True walk-forward       — expanding training window; test folds are
      strictly inside the WF period, never touching IS or holdout.
   4. Benchmark tracking      — every result logs excess_sharpe vs equal-weight
      buy-and-hold of the same universe over the same period.
@@ -237,7 +236,7 @@ def select_universe(raw: dict) -> dict:
 
 def three_way_split(data: dict) -> tuple[dict, dict, dict]:
     """
-    Explicit three-way split.
+    FIX 2 — Explicit three-way split.
 
     Returns:
         insample — 2010-01-01 → 2018-12-31  (meta-agent optimises here only)
@@ -325,6 +324,23 @@ def compute_metrics(returns: pd.Series, weights: pd.DataFrame,
 
 def walk_forward(insample: dict, wf: dict, signals_fn, sizes_fn,
                  n_folds: int = 3) -> dict:
+    """
+
+    Test folds are drawn exclusively from the wf dict (2021–2022).
+    Training for each fold starts at IS_START and expands through all
+    WF data seen before that fold's test window begins.
+
+    For n_folds=3 over ~504 WF trading days (~168 days per fold):
+      Fold 1 — context: IS only          → tests Jan–Jun 2021
+      Fold 2 — context: IS + fold-1 WF   → tests Jun–Nov 2021
+      Fold 3 — context: IS + folds 1-2   → tests Nov 2021–Dec 2022
+
+    Why context includes IS history:
+      get_signals() uses pct_change(252) and rolling(252). The first WF
+      date (Jan 2021) needs lookbacks reaching into 2019. Concatenating
+      IS + prior WF rows provides the full rolling history without leaking
+      future WF data into the signal.
+    """
     wf_dates = wf["close"].index
     n_wf_days = len(wf_dates)
     fold_days = n_wf_days // n_folds
@@ -447,6 +463,66 @@ def _log_result(result: dict, mode: str, description: str = "") -> None:
         ])
 
 
+# ── Best-agent snapshot ───────────────────────────────────────────────────────
+
+BEST_AGENT_FILE = AGENT_DIR / "best_agent.py"
+
+
+def _save_best_if_new(mode: str) -> None:
+    """
+    After each run, read results.csv and check whether the most recent
+    in-sample row is the all-time best by score. If so, snapshot the
+    current agent.py and write a summary to .agent/best_agent.py.
+
+    CSV is the single source of truth — no separate state file needed.
+    Walk-forward and holdout rows are ignored; only in_sample rows count.
+    """
+    if mode != "in_sample":
+        return
+    if not RESULTS_CSV.exists():
+        return
+
+    try:
+        df = pd.read_csv(RESULTS_CSV)
+    except Exception:
+        return
+
+    is_rows = df[df["mode"] == "in_sample"].copy()
+    if is_rows.empty:
+        return
+
+    is_rows["score"] = pd.to_numeric(
+        is_rows["score"], errors="coerce").fillna(0)
+    is_rows["excess_sharpe"] = pd.to_numeric(
+        is_rows["excess_sharpe"], errors="coerce").fillna(0)
+
+    best_idx = is_rows["score"].idxmax()
+    best_row = is_rows.loc[best_idx]
+    latest_row = is_rows.iloc[-1]
+
+    # Current run is the best if it matches the row with the highest score
+    if latest_row.name != best_idx:
+        return
+
+    import shutil
+    shutil.copy(Path(__file__), BEST_AGENT_FILE)
+
+    summary = {
+        "score":         round(float(best_row["score"]), 4),
+        "excess_sharpe": round(float(best_row["excess_sharpe"]), 4),
+        "sharpe":        round(float(pd.to_numeric(best_row.get("sharpe", 0), errors="coerce")), 4),
+        "description":   str(best_row.get("description", "")),
+        "timestamp":     str(best_row.get("timestamp", "")),
+    }
+
+    summary_path = AGENT_DIR / "best_score.json"
+    summary_path.write_text(json.dumps(summary, indent=2))
+
+    print(f"  ✓ New best → .agent/best_agent.py  "
+          f"score={summary['score']:.4f}  "
+          f"excess={summary['excess_sharpe']:+.4f}")
+
+
 # ── Single-run entry point ────────────────────────────────────────────────────
 
 def run_once(mode: str = "in_sample", description: str = "") -> dict:
@@ -487,6 +563,7 @@ def run_once(mode: str = "in_sample", description: str = "") -> dict:
 
     LAST_RESULT.write_text(json.dumps(result, indent=2))
     _log_result(result, mode, description)
+    _save_best_if_new(mode)
     return result
 
 
