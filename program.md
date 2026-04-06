@@ -20,8 +20,12 @@ It contains ONLY two functions — do not add anything else:
 4. Rewrite the editable section of `agent.py` with the new strategy
 5. Run the backtest with a short description of the change
 6. Read `last_result.json` for the score
-7. If score improved: keep the change. If not: revert `agent.py` to the previous version
-8. Every 5 successful improvements, run walk-forward validation
+7. If score improved: keep the change and increment your improvement counter. If not: revert `agent.py` to the previous version
+8. **If improvement counter is a multiple of 5, you MUST run walk-forward before continuing:**
+   - Run `python agent.py --walk-forward --desc "walk-forward check #N"`
+   - Read `last_result.json` — check `mean_oos_sharpe` and `pass`
+   - If `pass` is `false`: revert to the previous best, increment walk-forward failure counter, and try a more conservative version next
+   - If `pass` is `true`: reset walk-forward failure counter and continue
 9. Repeat
 
 ## Walk-Forward Rule
