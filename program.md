@@ -68,7 +68,7 @@ It contains ONLY two functions — do not add anything else:
 
 ## Walk-Forward Rule
 
-Every 5 successful improvements, run walk-forward manually.
+Every 3 successful improvements, run walk-forward manually.
 If mean OOS Sharpe < 0.8, revert to a more conservative version.
 If the same hypothesis fails walk-forward twice in a row, it is overfit —
 discard it and start from a new hypothesis.
