@@ -29,6 +29,7 @@ Design:
 """
 
 from __future__ import annotations
+import hashlib
 import json
 import argparse
 import importlib
@@ -140,7 +141,82 @@ LAST_RESULT = ROOT / "last_result.json"
 DATA_DIR.mkdir(exist_ok=True)
 AGENT_DIR.mkdir(exist_ok=True)
 
-# ── Tickers ───────────────────────────────────────────────────────────────────
+# ── Gate token helpers ────────────────────────────────────────────────────────
+#
+# last_passed_holdback.json records the MD5 hash of agent.py at the moment a
+# --check-holdback run passed. --walk-forward checks this token before running.
+# If the file is absent or the hash doesn't match the current code, WF is
+# blocked. This makes it mechanically impossible to run WF on code that has
+# not passed holdback.
+#
+# The hash is of the file bytes, not the mtime, so copying best_dev_agent.py
+# back (which updates mtime) still produces the correct hash if the content
+# is unchanged.
+
+GATE_TOKEN_FILE = AGENT_DIR / "last_passed_holdback.json"
+
+
+def _code_hash() -> str:
+    """MD5 of the current agent.py file contents."""
+    return hashlib.md5(Path(__file__).read_bytes()).hexdigest()
+
+
+def _write_gate_token(dev_sharpe: float, holdback_sharpe: float) -> None:
+    """Write gate token after a passing --check-holdback."""
+    token = {
+        "code_hash":       _code_hash(),
+        "timestamp":       datetime.now().isoformat(),
+        "dev_sharpe":      dev_sharpe,
+        "holdback_sharpe": holdback_sharpe,
+    }
+    GATE_TOKEN_FILE.write_text(json.dumps(token, indent=2))
+    print(f"  ✓ Gate token written  hash={token['code_hash'][:8]}…")
+
+
+def _invalidate_gate_if_code_changed() -> None:
+    """
+    Called at the top of every --in-sample run.
+    If agent.py has changed since the last passing holdback, delete the token
+    so that --walk-forward cannot proceed until --check-holdback is re-run.
+    """
+    if not GATE_TOKEN_FILE.exists():
+        return
+    try:
+        token = json.loads(GATE_TOKEN_FILE.read_text())
+    except Exception:
+        GATE_TOKEN_FILE.unlink(missing_ok=True)
+        return
+    if token.get("code_hash") != _code_hash():
+        GATE_TOKEN_FILE.unlink()
+        print("  [gate token invalidated — code changed since last holdback pass]")
+
+
+def _assert_gate_token_valid() -> None:
+    """
+    Called at the top of every --walk-forward run.
+    Exits with a clear error if no valid gate token exists for the current code.
+    """
+    if not GATE_TOKEN_FILE.exists():
+        print("✗ WALK-FORWARD BLOCKED")
+        print("  No passing holdback gate found for the current code.")
+        print("  Run --check-holdback first and ensure it passes.")
+        sys.exit(1)
+
+    try:
+        token = json.loads(GATE_TOKEN_FILE.read_text())
+    except Exception:
+        print("✗ WALK-FORWARD BLOCKED — gate token unreadable.")
+        sys.exit(1)
+
+    if token.get("code_hash") != _code_hash():
+        print("✗ WALK-FORWARD BLOCKED")
+        print("  agent.py has changed since the last passing holdback check.")
+        print("  Run --check-holdback again for the current code.")
+        sys.exit(1)
+
+    print(f"  ✓ Gate token valid  hash={token['code_hash'][:8]}…  "
+          f"holdback_sharpe={token.get('holdback_sharpe', '?')}")
+
 
 SP500_TICKERS = [
     "AAPL", "MSFT", "AMZN", "NVDA", "GOOGL", "META", "TSLA", "BRK-B", "UNH", "LLY",
@@ -395,7 +471,8 @@ def run_holdback_gate(pit_data: dict, dev_metrics: dict,
               f"hb_excess={hb_excess:+.3f}")
     else:
         print(f"  ✗ Holdback gate FAILED: {'; '.join(reasons)}")
-        print("  → Revert to best_agent.py. This hypothesis is permanently closed.")
+        print(
+            "  → Revert to best_holdback_agent.py. This hypothesis is permanently closed.")
 
     return {
         "holdback_gate_pass":   gate_pass,
@@ -703,6 +780,13 @@ def _save_best_if_new(mode: str, result: dict) -> None:
                       f"holdback_sharpe={summary['holdback_sharpe']:.4f}  "
                       f"excess={summary['excess_sharpe']:+.4f}")
 
+        # Write gate token regardless of whether this is the all-time best —
+        # any passing holdback unlocks walk-forward for the current code.
+        _write_gate_token(
+            dev_sharpe=result.get("dev_sharpe", result.get("sharpe", 0)),
+            holdback_sharpe=result.get("holdback_sharpe", 0),
+        )
+
 
 # ── Single-run entry point ────────────────────────────────────────────────────
 
@@ -740,6 +824,8 @@ def run_once(mode: str = "in_sample", description: str = "") -> dict:
             result[label] = compute_metrics(r_sub, w_sub, bm_sharpe=bm_sub)
 
     elif mode == "walk_forward":
+        # Gate check — exits with clear error if holdback not passed for current code
+        _assert_gate_token_valid()
         print("Running walk-forward (2019-2021, 3 folds)...")
         result = walk_forward(dev, wf, signals_fn, sizes_fn)
 
@@ -767,6 +853,8 @@ def run_once(mode: str = "in_sample", description: str = "") -> dict:
 
     else:
         # --in-sample: DEV period only. Holdback is NOT evaluated.
+        # Invalidate gate token if code has changed since last passing holdback.
+        _invalidate_gate_if_code_changed()
         print("Running dev backtest (2010-2016)...")
         print("  [Holdback suppressed — use --check-holdback when ready to commit]")
 

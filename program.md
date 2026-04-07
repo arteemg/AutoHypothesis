@@ -93,7 +93,7 @@ PARAMETER:   If changing a parameter: what range was considered, and why
 If you cannot write a convincing WHY that names a specific mechanism,
 do not run the experiment. Move to the next hypothesis instead.
 
-### Step 3 — Iterate on DEV only (no holdback visibility)
+### Step 3 — Iterate on DEV only
 
 Run experiments freely against the DEV period (2010–2016):
 
@@ -108,8 +108,7 @@ Do NOT attempt to infer holdback performance from any output.
 Iterate purely on DEV until you are satisfied with the result for this
 hypothesis and ready to commit.
 
-Change ONE thing at a time. If more than ~10 lines change, you are likely
-making a compound change — split into separate experiments.
+Change ONE thing at a time.
 
 A result on DEV counts as an improvement only if ALL hold:
 
@@ -188,8 +187,6 @@ Walk-forward pass criteria — ALL must hold:
 - Re-running WF with "just one small fix"
 - Revisiting a failed hypothesis with different params but the same mechanism
 
-A near-miss WF result is a full failure. Move on.
-
 After walk-forward:
 
 - PASS → freeze code as best, move to next hypothesis
@@ -205,18 +202,6 @@ Repeat until a stopping criterion is met:
 Do not stop for any other reason. Do not ask whether to continue.
 Hitting a high DEV score alone is not a stopping condition — only a
 passing walk-forward result counts as genuine progress.
-
----
-
-## Holdout (Final Run Only)
-
-Run once, at the very end, after all hypotheses are finalized:
-
-```bash
-python agent.py --holdout --desc "final holdout: best strategy"
-```
-
-Do not use holdout results to make any further changes to the strategy.
 
 ---
 
