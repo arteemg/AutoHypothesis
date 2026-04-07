@@ -1,4 +1,4 @@
-# Quant Autoagent — Research Directive
+## Quant Autoagent — Research Directive
 
 ## Meta-Agent Instructions
 
@@ -12,149 +12,236 @@ It contains ONLY two functions — do not add anything else:
 - `get_signals(data)` → pd.DataFrame[bool]
 - `get_position_sizes(signals, data)` → pd.DataFrame[float]
 
+---
+
+## Data Split (Fixed — Do Not Change)
+
+```
+2010 ─────── 2016 | 2017─2018 | 2019 ──────── 2021 | 2022 ──── 2024
+   DEVELOP         IS HOLDBACK   WALK-FORWARD          HOLDOUT
+ (iterate here)  (one check    (1 shot/hypothesis)    (locked)
+                  per hyp.)
+```
+
+**Asset class:** US equities (S&P 500 universe)
+**Universe:** Top 150 stocks by 30-day average dollar volume, selected from
+in-sample data (2010–2018) only — future liquidity never influences universe.
+**Development:** 2010–2016 (~1,760 trading days) — iterate freely here.
+**IS Holdback:** 2017–2018 (~504 trading days) — checked ONCE per hypothesis,
+never during parameter exploration within a hypothesis.
+**Walk-forward:** 2019–2021 (3 expanding folds) — one shot per hypothesis.
+**Holdout:** 2022–2024 — locked until the single final run.
+
+---
+
+## Agent Snapshots
+
+Two files in `.agent/` serve as revert points. They are written automatically
+by the harness — never copy or edit them manually.
+
+| File                     | Written when                            | Use for                                                    |
+| ------------------------ | --------------------------------------- | ---------------------------------------------------------- |
+| `best_dev_agent.py`      | `--in-sample` sets a new DEV score high | Reverting a bad DEV experiment within a hypothesis         |
+| `best_holdback_agent.py` | `--check-holdback` passes the gate      | Reverting after a holdback failure or walk-forward failure |
+
+**The key distinction:**
+
+- `best_dev_agent.py` may contain code whose holdback has never been checked.
+  Use it only to undo a bad within-hypothesis tweak.
+- `best_holdback_agent.py` is always a fully validated state (DEV + holdback
+  gate passed). This is the safe revert point when a hypothesis is closed.
+
+On a fresh run with no prior history, neither file exists yet. The first
+`--in-sample` run creates `best_dev_agent.py`. The first passing
+`--check-holdback` creates `best_holdback_agent.py`.
+
+---
+
+## Score Formula
+
+```
+score = sharpe
+      - max(0, (turnover - 0.3) * 0.5)      # penalize high turnover
+      - max(0, (|max_drawdown| - 0.20) * 2)  # penalize deep drawdowns
+```
+
+---
+
 ## Experiment Loop
 
-1. Read the current editable section of `agent.py`.
+### Step 1 — Read current state
 
-2. Read `results.csv` to understand what has been tried and what failed.
-   - Inspect the INEFFICIENCY field of every past `--desc` entry.
-   - Do not repeat an approach unless you have a genuinely new economic
-     justification. Parameter sweeps (e.g. "try 93rd pct instead of 95th")
-     with no new rationale are forbidden.
+Read the current editable section of `agent.py`.
+Read `results.csv` to understand what has been tried and what failed.
+Inspect the description field of every past entry.
+Do not repeat an approach unless you have a genuinely new economic
+justification. Parameter sweeps with no new rationale are forbidden.
 
-3. Propose ONE focused change. Before writing any code, write a rationale
-   using this exact format:
+### Step 2 — Declare hypothesis
 
-   **CHANGE:** One sentence on what you are changing.  
-   **WHY:** One sentence on why it should improve the score — name a specific
-   mechanism. "To see if it helps" is not valid.
+Before writing any code, write a rationale using this exact format:
 
-   If you cannot write a convincing WHY, do not run the experiment.
-   Move to the next hypothesis in the hypothesis space instead.
+```
+HYPOTHESIS:  The economic mechanism you are testing (one sentence).
+CHANGE:      Exactly what code changes, one sentence.
+WHY:         Specific mechanism — cite a paper or name a known market effect.
+             "To see if it helps" is not valid.
+PARAMETER:   If changing a parameter: what range was considered, and why
+             this specific value — not just "I tried 200".
+```
 
-4. Rewrite the editable section of `agent.py` with the new strategy.
-   Change ONE thing at a time. If more than ~10 lines change, you are likely
-   making a compound change — split it into separate experiments.
+If you cannot write a convincing WHY that names a specific mechanism,
+do not run the experiment. Move to the next hypothesis instead.
 
-5. Run the backtest. The `--desc` argument is mandatory and must follow this
-   structure exactly (keep each sentence under 100 characters):
+### Step 3 — Iterate on DEV only (no holdback visibility)
 
-   ```
-   python agent.py --in-sample --desc "CHANGE: <what you are changing>. WHY: <why it should improve the score>."
-   ```
+Run experiments freely against the DEV period (2010–2016):
 
-   Do NOT run the experiment if you cannot write a honest WHY sentence.
-   "WHY: to see if it helps" is not valid. A WHY must name a specific
-   mechanism — if you cannot name one, the experiment should not run.
+```bash
+python agent.py --in-sample \
+  --desc "HYPOTHESIS: <n>. CHANGE: <what>. WHY: <why>."
+```
 
-6. Read `last_result.json` for the score. Also check `excess_sharpe` — a
-   result only counts as a genuine improvement if BOTH `score` AND
-   `excess_sharpe` improve. A rising score driven purely by bull-market
-   beta (excess_sharpe near zero or negative) is not real edge.
+**The holdback result is suppressed during `--in-sample` runs.**
+You will only see DEV metrics: sharpe, drawdown, turnover, score.
+Do NOT attempt to infer holdback performance from any output.
+Iterate purely on DEV until you are satisfied with the result for this
+hypothesis and ready to commit.
 
-7. If score improved: keep the change and increment your improvement counter.
-   If not: revert `agent.py` to the previous version. Do not try a minor
-   variation of the same idea without a new economic justification — a failed
-   hypothesis is a failed hypothesis.
+Change ONE thing at a time. If more than ~10 lines change, you are likely
+making a compound change — split into separate experiments.
 
-8. **If improvement counter is a multiple of 5, you MUST run walk-forward
-   before continuing:**
-   - Run: `python agent.py --walk-forward --desc "CHANGE: <same as last kept change>. WF-CHECK: #N"`
-   - Read `last_result.json` — check `mean_oos_sharpe`, `mean_excess_sharpe`,
-     and `pass`.
-   - If `pass` is `false`: revert to the previous best. Ask whether the
-     underlying inefficiency hypothesis is still convincing given the OOS
-     evidence. If the same hypothesis has failed walk-forward twice, abandon
-     it entirely and move to a new one from the hypothesis space below.
-   - If `pass` is `true`: reset walk-forward failure counter and continue.
+A result on DEV counts as an improvement only if ALL hold:
 
-9. Repeat until a stopping criterion is met.
+- `score` improves over the best known DEV score
+- `excess_sharpe` > 0.15
 
-## Walk-Forward Rule
+If improved: keep the change, increment improvement counter.
+If not: revert immediately:
 
-Every 5 successful improvements, run walk-forward.
-Walk-forward tests on the locked 2019–2021 window (3 expanding folds) —
-this period is never seen during in-sample optimisation.
-If mean OOS Sharpe < 0.8 OR mean excess Sharpe <= 0, revert to a more
-conservative version.
-If the same hypothesis fails walk-forward twice in a row, it is overfit —
-discard it and start from a new hypothesis.
+```bash
+cp .agent/best_dev_agent.py agent.py
+python agent.py --in-sample --desc "revert check"
+```
 
-## Stopping Criteria
+Score must match `.agent/best_dev_score.json` before continuing.
 
-- Score > 1.8 — target achieved
-- 50 iterations — time limit
-- 3 consecutive walk-forward failures — likely overfit, stop
+### Step 4 — Holdback gate (once per hypothesis, never during iteration)
+
+Only after you are fully satisfied with the DEV result and ready to commit
+the hypothesis, run the holdback check:
+
+```bash
+python agent.py --check-holdback \
+  --desc "HYPOTHESIS: <n>. HOLDBACK CHECK."
+```
+
+**This is a one-shot check. You may not adjust parameters and re-check.**
+One check, one verdict. Running `--check-holdback` means you are committed.
+
+Holdback gate — ALL must hold:
+
+| Condition                                   | Threshold |
+| ------------------------------------------- | --------- |
+| `holdback_sharpe >= decay_min × dev_sharpe` | 0.50×     |
+| `holdback_excess > excess_min`              | 0.10      |
+
+If gate fails → revert entire hypothesis, permanently closed:
+
+```bash
+cp .agent/best_holdback_agent.py agent.py
+python agent.py --in-sample --desc "revert after holdback fail"
+```
+
+If gate passes → eligible for walk-forward (step 5).
+
+### Step 5 — Walk-forward (one shot per hypothesis)
+
+Before running, declare in your output:
+
+```
+HYPOTHESIS:     <n>
+MECHANISM:      <one sentence economic justification>
+BEST_IS_SCORE:  <score from last_result.json>
+COMMITTED:      yes — walk-forward result is final for this hypothesis
+```
+
+Then run:
+
+```bash
+python agent.py --walk-forward \
+  --desc "HYPOTHESIS: <n>. COMMITTED: yes. WF-CHECK: #N"
+```
+
+Walk-forward pass criteria — ALL must hold:
+
+| Metric                | Threshold | Notes                            |
+| --------------------- | --------- | -------------------------------- |
+| `mean_oos_sharpe`     | ≥ 0.80    |                                  |
+| `mean_excess_sharpe`  | ≥ 0.15    | Must meaningfully beat benchmark |
+| `oos_is_sharpe_ratio` | ≥ 0.50    | OOS Sharpe must be ≥ 50% of dev  |
+| `fold_pass_count`     | ≥ 2       | At least 2 of 3 folds clear 0.60 |
+
+**Forbidden after seeing a walk-forward result:**
+
+- Tweaking parameters because WF score was close to threshold
+- Re-running WF with "just one small fix"
+- Revisiting a failed hypothesis with different params but the same mechanism
+
+A near-miss WF result is a full failure. Move on.
+
+After walk-forward:
+
+- PASS → freeze code as best, move to next hypothesis
+- FAIL → revert to `best_holdback_agent.py`, hypothesis permanently closed
+
+### Step 6 — Repeat
+
+Repeat until a stopping criterion is met:
+
+- `mean_oos_sharpe >= 1.2` on a passed walk-forward — target achieved
+- 100 iterations — time limit
+
+Do not stop for any other reason. Do not ask whether to continue.
+Hitting a high DEV score alone is not a stopping condition — only a
+passing walk-forward result counts as genuine progress.
+
+---
+
+## Holdout (Final Run Only)
+
+Run once, at the very end, after all hypotheses are finalized:
+
+```bash
+python agent.py --holdout --desc "final holdout: best strategy"
+```
+
+Do not use holdout results to make any further changes to the strategy.
 
 ---
 
 ## Research Directive
 
-**Asset class:** US equities (S&P 500 universe)  
-**Data:** Daily OHLCV — see split below
-**Universe:** Top 150 stocks by 30-day average dollar volume (selected from
-in-sample data only — future liquidity does not influence universe choice)
-**In-sample:** 2010–2018 (~2,270 trading days, includes GFC tail, EU debt crisis, 2015 oil crash)
-**Walk-forward:** 2019–2021 (3 expanding folds, includes 2019 bull, COVID crash and recovery)
-**Holdout:** 2022–2024 (rates shock + AI rally — locked until final run)
+**Target metrics (after 10bps transaction costs):**
 
-**Data split (fixed — do not change):**
-
-```
-2010 ──────────────── 2018 | 2019 ──────── 2021 | 2022 ──── 2024
-      IN-SAMPLE              WALK-FORWARD          HOLDOUT
-   (optimise here only)     (test only, 3 folds)   (locked)
-```
-
-**Target metrics:**
-
-- Sharpe ratio > 1.2 (annualized, after 10bps transaction costs)
-- Excess Sharpe > 0.3 over equal-weight buy-and-hold of the same universe
+- Sharpe ratio > 1.2 (annualized)
+- Excess Sharpe > 0.3 over equal-weight buy-and-hold of same universe
 - Max drawdown < 25%
 - Monthly turnover < 50%
 - Long-only (no shorting)
 
-**Score formula:**
+**Available data keys in `get_signals()` and `get_position_sizes()`:**
 
-```
-score = sharpe
-      - max(0, (turnover - 0.3) * 0.5)       # penalize high turnover
-      - max(0, (|max_drawdown| - 0.20) * 2)  # penalize deep drawdowns
-```
+- `data["close"]` — daily adjusted close prices
+- `data["high"]` — daily adjusted highs
+- `data["low"]` — daily adjusted lows
+- `data["volume"]` — daily share volume
+- `data["spy"]` — SPY close prices
 
-**Walk-forward pass criteria (both must hold):**
+All keys are pd.DataFrame with shape (dates × tickers) except `spy` which
+is (dates × 1). All fields are already loaded and cached.
 
-```
-mean_oos_sharpe    >= 0.8
-mean_excess_sharpe >  0.0   (strategy must beat equal-weight benchmark)
-```
-
-**Hypothesis space — explore roughly in this order:**
-
-1. Cross-sectional momentum (rank by N-month return, skip 1 month)
-2. Market regime filter (SPY above/below moving average)
-3. Volatility-scaled position sizing (inverse vol weighting)
-4. Mean reversion on short lookbacks (1-5 day reversal)
-5. Trend following on individual stocks (price vs MA)
-6. Combining momentum + trend filter
-7. Realized vol regime conditioning (reduce exposure in high-vol periods)
-8. Volume filters (only trade stocks with above-average volume)
-9. Earnings blackout (avoid holding around earnings — proxy via vol spikes)
-
-**What has worked in the academic literature:**
-
-- 12-1 momentum is robust but suffers from momentum crashes in bear markets
-- Market regime filter (SPY > 200d MA) materially reduces drawdown
-- Volatility scaling improves Sharpe by dampening exposure in volatile periods
-- Low turnover is critical — 10bps/trade destroys high-turnover strategies
-- Combining signals improves Sharpe vs single-signal strategies
-
-**What tends to overfit:**
-
-- Very short lookbacks on individual signals (< 5 days)
-- Too many simultaneous parameter changes
-- Strategies that only work in one regime (pure bull-market momentum)
-- High score with near-zero excess_sharpe (benchmark doing the work)
+---
 
 ## How to Run
 
@@ -162,15 +249,21 @@ mean_excess_sharpe >  0.0   (strategy must beat equal-weight benchmark)
 # Install deps
 pip install -e .
 
-# Establish baseline (first run, no changes)
+# Establish baseline on DEV period only (holdback suppressed)
 python agent.py --in-sample --desc "baseline: 12-1 momentum + SPY 200d regime"
 
-# After editing the editable section, run a backtest
-python agent.py --in-sample --desc "CHANGE: added inverse vol weighting. WHY: reduces exposure to high-vol stocks before drawdowns."
+# Iterate on DEV — holdback not shown
+python agent.py --in-sample \
+  --desc "HYPOTHESIS: vol scaling. CHANGE: inverse vol weighting. WHY: dampens exposure before drawdowns."
 
-# Run walk-forward validation (every 5 improvements)
-python agent.py --walk-forward --desc "CHANGE: <same as last kept>. WF-CHECK: #1"
+# Holdback gate — run ONCE per hypothesis when ready to commit
+python agent.py --check-holdback \
+  --desc "HYPOTHESIS: vol scaling. HOLDBACK CHECK."
 
-# Final holdout eval (only once, at the end)
+# Walk-forward — run once per hypothesis, committed
+python agent.py --walk-forward \
+  --desc "HYPOTHESIS: vol scaling. COMMITTED: yes. WF-CHECK: #1"
+
+# Final holdout — only once, run by human
 python agent.py --holdout --desc "final holdout: best strategy"
 ```

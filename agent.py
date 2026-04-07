@@ -5,16 +5,27 @@ The meta-agent edits everything above the FIXED ADAPTER BOUNDARY.
 The fixed section below handles data loading, simulation, scoring, and walk-forward.
 
 Run:
-  python agent.py                  # single in-sample backtest
-  python agent.py --walk-forward   # expanding walk-forward on 2019-2021
-  python agent.py --holdout        # final holdout eval (run once, at the very end)
-  
+  python agent.py --in-sample       # dev (2010-2016) only — holdback suppressed
+  python agent.py --check-holdback  # holdback gate — run once per hypothesis
+  python agent.py --walk-forward    # expanding walk-forward on 2019-2021
+  python agent.py --holdout         # final holdout eval (run once, at the very end)
+
+Design:
   1. Point-in-time universe  — universe selected from IS dollar volume only.
-  2. Explicit three-way split — IS (2010-2018), WF (2019-2021), holdout (2022+).
-  3. True walk-forward       — expanding training window; test folds are
-     strictly inside the WF period, never touching IS or holdout.
-  4. Benchmark tracking      — every result logs excess_sharpe vs equal-weight
-     buy-and-hold of the same universe over the same period.
+  2. Four-way split          — DEV (2010-2016), HOLDBACK (2017-2018),
+                               WF (2019-2021), HOLDOUT (2022+).
+  3. Holdback gate           — only triggered by --check-holdback, NOT by
+                               --in-sample. Agent iterates on DEV without
+                               ever seeing holdback results. One check per
+                               hypothesis; one verdict, no re-checks.
+  4. True walk-forward       — expanding training window; test folds are
+                               strictly inside the WF period.
+  5. WF pass criteria        — requires mean_oos_sharpe >= 0.80,
+                               mean_excess_sharpe >= 0.15,
+                               oos_is_sharpe_ratio >= 0.50,
+                               fold_pass_count >= 2.
+  6. Benchmark tracking      — every result logs excess_sharpe vs equal-weight
+                               buy-and-hold of the same universe.
 """
 
 from __future__ import annotations
@@ -32,7 +43,7 @@ import numpy as np
 
 
 # ============================================================================
-# EDITABLE HARNESS — meta-agent modifies this section
+# EDITABLE SECTION — meta-agent modifies only this section
 # ============================================================================
 
 def get_signals(data: dict) -> pd.DataFrame:
@@ -51,14 +62,12 @@ def get_signals(data: dict) -> pd.DataFrame:
 
     # 12-1 momentum: 12-month return, skip most recent month
     momentum = close.pct_change(252).shift(21)
+    ranked = momentum.rank(axis=1, pct=True)
+    top_momentum = ranked > 0.90
 
     # Market regime: only long when SPY is above its 200-day MA
     spy_200d = spy.rolling(200).mean()
     in_bull_market = spy > spy_200d
-
-    # Take top 10% by momentum score
-    ranked = momentum.rank(axis=1, pct=True)
-    top_momentum = ranked > 0.90
 
     signals = top_momentum & in_bull_market.values.reshape(-1, 1)
     return signals.fillna(False)
@@ -92,19 +101,35 @@ warnings.filterwarnings("ignore")
 
 UNIVERSE_SIZE = 150
 
-# In-sample: the only period the meta-agent ever optimises against
-IS_START = "2010-01-01"
-IS_END = "2018-12-31"
+# Development: the only period the meta-agent ever optimises against
+DEV_START = "2010-01-01"
+DEV_END = "2016-12-31"
 
-# Walk-forward: test folds are drawn exclusively from this window
+# IS Holdback: evaluated ONLY via --check-holdback, never during --in-sample
+HOLDBACK_START = "2017-01-01"
+HOLDBACK_END = "2018-12-31"
+
+# Convenience alias: full in-sample = DEV + HOLDBACK
+IS_START = DEV_START
+IS_END = HOLDBACK_END
+
+# Walk-forward: test folds drawn exclusively from this window
 WF_START = "2019-01-01"
 WF_END = "2021-12-31"
 
-# Kept for legacy CLI compatibility — equals WF_END
-TRAIN_END = WF_END
-
 # Holdout: never touched until the single final run
 HOLDOUT_START = "2022-01-01"
+
+# Holdback gate thresholds (checked once per hypothesis)
+HOLDBACK_DECAY_MIN = 0.50   # holdback_sharpe >= this * dev_sharpe
+HOLDBACK_EXCESS_MIN = 0.10   # holdback_excess must exceed this
+
+# Walk-forward pass thresholds
+WF_MEAN_SHARPE_MIN = 0.80
+WF_MEAN_EXCESS_MIN = 0.15
+WF_DECAY_RATIO_MIN = 0.50   # mean_oos_sharpe / dev_sharpe
+WF_FOLD_SHARPE_MIN = 0.60   # per-fold threshold for fold_pass_count
+WF_FOLD_PASS_MIN = 2      # number of folds that must clear WF_FOLD_SHARPE_MIN
 
 TRANSACTION_COST = 0.0010
 ROOT = Path(__file__).parent
@@ -208,12 +233,8 @@ def select_universe(raw: dict) -> dict:
     Point-in-time universe selection.
 
     Universe is chosen by average 30-day dollar volume computed using
-    in-sample data only (2010–2018). Future liquidity figures never
-    influence which stocks appear in the training universe.
-
-    The full time series for the selected tickers is returned — the
-    selection criterion used only IS data, but all periods remain
-    available for later slicing into IS / WF / holdout.
+    full in-sample data (2010-2018) only. Future liquidity figures never
+    influence which stocks appear in the universe.
     """
     is_close = _slice(raw["close"],  IS_START, IS_END)
     is_volume = _slice(raw["volume"], IS_START, IS_END)
@@ -234,14 +255,15 @@ def select_universe(raw: dict) -> dict:
     }
 
 
-def three_way_split(data: dict) -> tuple[dict, dict, dict]:
+def four_way_split(data: dict) -> tuple[dict, dict, dict, dict]:
     """
-    FIX 2 — Explicit three-way split.
+    Split data into four non-overlapping periods.
 
     Returns:
-        insample — 2010-01-01 → 2018-12-31  (meta-agent optimises here only)
-        wf       — 2019-01-01 → 2021-12-31  (walk-forward test territory)
-        holdout  — 2022-01-01 → ...          (locked until the very final run)
+        dev      — 2010-01-01 → 2016-12-31  (agent optimises here only)
+        holdback — 2017-01-01 → 2018-12-31  (one-shot decay gate per hypothesis)
+        wf       — 2019-01-01 → 2021-12-31  (walk-forward, one shot per hypothesis)
+        holdout  — 2022-01-01 → ...          (locked until final run)
     """
     def _make(start, end):
         return {
@@ -249,10 +271,11 @@ def three_way_split(data: dict) -> tuple[dict, dict, dict]:
             for k, v in data.items()
         }
 
-    insample = _make(IS_START,      IS_END)
-    wf = _make(WF_START,      WF_END)
-    holdout = _make(HOLDOUT_START, "2099-12-31")
-    return insample, wf, holdout
+    dev = _make(DEV_START,      DEV_END)
+    holdback = _make(HOLDBACK_START, HOLDBACK_END)
+    wf = _make(WF_START,       WF_END)
+    holdout = _make(HOLDOUT_START,  "2099-12-31")
+    return dev, holdback, wf, holdout
 
 
 # ── Benchmark ─────────────────────────────────────────────────────────────────
@@ -320,26 +343,86 @@ def compute_metrics(returns: pd.Series, weights: pd.DataFrame,
     }
 
 
+# ── Holdback gate (one-shot, explicit flag only) ──────────────────────────────
+
+def run_holdback_gate(pit_data: dict, dev_metrics: dict,
+                      signals_fn, sizes_fn) -> dict:
+    """
+    Evaluate the IS holdback gate.
+
+    Called ONLY by --check-holdback. Never called during --in-sample.
+
+    Gate passes only if ALL hold:
+      holdback_sharpe >= HOLDBACK_DECAY_MIN * dev_sharpe
+      holdback_excess >= HOLDBACK_EXCESS_MIN
+    """
+    # Use full IS context so rolling windows are valid on holdback dates
+    full_is = {
+        k: _slice(v, IS_START, IS_END) if isinstance(v, pd.DataFrame) else v
+        for k, v in pit_data.items()
+    }
+    hb_ret_full, hb_wgt_full = simulate(full_is, signals_fn, sizes_fn)
+    hb_ret = hb_ret_full[hb_ret_full.index >= HOLDBACK_START]
+    hb_wgt = hb_wgt_full[hb_wgt_full.index >= HOLDBACK_START]
+    hb_bm_full = benchmark_returns(full_is)
+    hb_bm = benchmark_sharpe(hb_bm_full[hb_bm_full.index >= HOLDBACK_START])
+
+    hb_m = compute_metrics(hb_ret, hb_wgt, bm_sharpe=hb_bm)
+
+    dev_sharpe = dev_metrics.get("sharpe", 0)
+    hb_sharpe = hb_m.get("sharpe", 0)
+    hb_excess = hb_m.get("excess_sharpe", 0)
+
+    decay_ok = hb_sharpe >= HOLDBACK_DECAY_MIN * dev_sharpe
+    excess_ok = hb_excess >= HOLDBACK_EXCESS_MIN
+    gate_pass = decay_ok and excess_ok
+
+    reasons = []
+    if not decay_ok:
+        reasons.append(
+            f"holdback_sharpe {hb_sharpe:.3f} < "
+            f"{HOLDBACK_DECAY_MIN} * dev_sharpe {dev_sharpe:.3f} "
+            f"= {HOLDBACK_DECAY_MIN * dev_sharpe:.3f}"
+        )
+    if not excess_ok:
+        reasons.append(
+            f"holdback_excess {hb_excess:.3f} < {HOLDBACK_EXCESS_MIN}"
+        )
+
+    if gate_pass:
+        print(f"  ✓ Holdback gate PASSED  "
+              f"hb_sharpe={hb_sharpe:.3f}  "
+              f"hb_excess={hb_excess:+.3f}")
+    else:
+        print(f"  ✗ Holdback gate FAILED: {'; '.join(reasons)}")
+        print("  → Revert to best_agent.py. This hypothesis is permanently closed.")
+
+    return {
+        "holdback_gate_pass":   gate_pass,
+        "dev_sharpe":           round(dev_sharpe, 4),
+        "holdback_sharpe":      round(hb_sharpe, 4),
+        "holdback_excess":      round(hb_excess, 4),
+        "holdback_decay_ratio": round(hb_sharpe / dev_sharpe
+                                      if dev_sharpe != 0 else 0, 4),
+        "holdback":             hb_m,
+    }
+
+
 # ── Walk-forward ──────────────────────────────────────────────────────────────
 
-def walk_forward(insample: dict, wf: dict, signals_fn, sizes_fn,
+def walk_forward(dev: dict, wf: dict, signals_fn, sizes_fn,
                  n_folds: int = 3) -> dict:
     """
+    Expanding walk-forward over the WF period (2019-2021).
 
-    Test folds are drawn exclusively from the wf dict (2021–2022).
-    Training for each fold starts at IS_START and expands through all
-    WF data seen before that fold's test window begins.
+    For n_folds=3 over ~756 WF trading days (~252 days per fold):
+      Fold 1 — context: DEV only           -> tests ~2019
+      Fold 2 — context: DEV + fold-1 WF    -> tests ~2020
+      Fold 3 — context: DEV + folds 1-2    -> tests ~2021
 
-    For n_folds=3 over ~504 WF trading days (~168 days per fold):
-      Fold 1 — context: IS only          → tests Jan–Jun 2021
-      Fold 2 — context: IS + fold-1 WF   → tests Jun–Nov 2021
-      Fold 3 — context: IS + folds 1-2   → tests Nov 2021–Dec 2022
-
-    Why context includes IS history:
-      get_signals() uses pct_change(252) and rolling(252). The first WF
-      date (Jan 2021) needs lookbacks reaching into 2019. Concatenating
-      IS + prior WF rows provides the full rolling history without leaking
-      future WF data into the signal.
+    Test folds are evaluated in isolation — OOS returns are only those
+    from the unseen test window. Training context provides rolling-window
+    history without leaking future WF data into signal computation.
     """
     wf_dates = wf["close"].index
     n_wf_days = len(wf_dates)
@@ -350,18 +433,14 @@ def walk_forward(insample: dict, wf: dict, signals_fn, sizes_fn,
         test_start_idx = i * fold_days
         test_end_idx = (i + 1) * fold_days if i < n_folds - 1 else n_wf_days
         test_dates = wf_dates[test_start_idx:test_end_idx]
-        # WF rows seen before this fold
         wf_seen_dates = wf_dates[:test_start_idx]
 
-        # Build context: IS history + any WF rows before the test window
         def _build(key):
-            parts = [insample[key]]
+            parts = [dev[key]]
             if len(wf_seen_dates) > 0:
                 parts.append(wf[key][wf[key].index.isin(wf_seen_dates)])
             return pd.concat(parts).sort_index()
 
-        # Extend context through the test window so signals can be computed
-        # on test dates (rolling windows need the preceding rows)
         def _full(key):
             return pd.concat([
                 _build(key),
@@ -374,13 +453,12 @@ def walk_forward(insample: dict, wf: dict, signals_fn, sizes_fn,
             "low":     _full("low"),
             "volume":  _full("volume"),
             "spy":     _full("spy"),
-            "tickers": insample["tickers"],
+            "tickers": dev["tickers"],
         }
 
         try:
             ret_full, wgt_full = simulate(full_ctx, signals_fn, sizes_fn)
 
-            # Evaluate on test dates only — this is the genuine OOS result
             ret_test = ret_full[ret_full.index.isin(test_dates)]
             wgt_test = wgt_full[wgt_full.index.isin(test_dates)]
 
@@ -390,19 +468,19 @@ def walk_forward(insample: dict, wf: dict, signals_fn, sizes_fn,
 
             m = compute_metrics(ret_test, wgt_test, bm_sharpe=bm_shr)
             m["fold"] = i + 1
-            m["train_days"] = len(insample["close"]) + len(wf_seen_dates)
+            m["train_days"] = len(dev["close"]) + len(wf_seen_dates)
             m["test_days"] = len(test_dates)
-            m["period"] = f"{test_dates[0].date()} → {test_dates[-1].date()}"
+            m["period"] = f"{test_dates[0].date()} -> {test_dates[-1].date()}"
             m["train_end"] = (str(wf_seen_dates[-1].date())
                               if len(wf_seen_dates) else
-                              str(insample["close"].index[-1].date()))
+                              str(dev["close"].index[-1].date()))
 
         except Exception as e:
             m = {"fold": i + 1, "error": str(e), "sharpe": 0,
                  "score": 0, "excess_sharpe": 0}
 
         folds.append(m)
-        print(f"  Fold {i + 1}/{n_folds}: {m.get('period', '')}  "
+        print(f"  Fold {i+1}/{n_folds}: {m.get('period', '')}  "
               f"sharpe={m.get('sharpe', 0):.3f}  "
               f"excess={m.get('excess_sharpe', 0):+.3f}")
 
@@ -410,16 +488,61 @@ def walk_forward(insample: dict, wf: dict, signals_fn, sizes_fn,
     excess_sharpes = [f["excess_sharpe"]
                       for f in folds if "excess_sharpe" in f]
 
+    mean_oos = round(np.mean(sharpes),        4) if sharpes else 0
+    mean_exc = round(np.mean(excess_sharpes), 4) if excess_sharpes else 0
+    std_oos = round(np.std(sharpes),         4) if sharpes else 0
+
+    dev_sharpe_ref = 0.0
+    best_score_path = AGENT_DIR / "best_score.json"
+    if best_score_path.exists():
+        try:
+            dev_sharpe_ref = json.loads(
+                best_score_path.read_text()).get("dev_sharpe", 0.0)
+        except Exception:
+            pass
+    oos_is_ratio = round(
+        mean_oos / dev_sharpe_ref if dev_sharpe_ref > 0 else 0.0, 4)
+
+    fold_pass_count = sum(1 for s in sharpes if s >= WF_FOLD_SHARPE_MIN)
+
+    passed = bool(
+        mean_oos >= WF_MEAN_SHARPE_MIN and
+        mean_exc >= WF_MEAN_EXCESS_MIN and
+        oos_is_ratio >= WF_DECAY_RATIO_MIN and
+        fold_pass_count >= WF_FOLD_PASS_MIN
+    )
+
+    reasons_failed = []
+    if mean_oos < WF_MEAN_SHARPE_MIN:
+        reasons_failed.append(
+            f"mean_oos_sharpe {mean_oos} < {WF_MEAN_SHARPE_MIN}")
+    if mean_exc < WF_MEAN_EXCESS_MIN:
+        reasons_failed.append(
+            f"mean_excess_sharpe {mean_exc} < {WF_MEAN_EXCESS_MIN}")
+    if oos_is_ratio < WF_DECAY_RATIO_MIN:
+        reasons_failed.append(
+            f"oos_is_sharpe_ratio {oos_is_ratio} < {WF_DECAY_RATIO_MIN}")
+    if fold_pass_count < WF_FOLD_PASS_MIN:
+        reasons_failed.append(
+            f"fold_pass_count {fold_pass_count} < {WF_FOLD_PASS_MIN}")
+
+    if passed:
+        print(f"  ✓ Walk-forward PASSED  mean_oos={mean_oos:.3f}  "
+              f"excess={mean_exc:+.3f}  decay_ratio={oos_is_ratio:.2f}  "
+              f"folds_passed={fold_pass_count}/3")
+    else:
+        print(f"  ✗ Walk-forward FAILED: {'; '.join(reasons_failed)}")
+
     return {
-        "type":               "walk_forward",
-        "folds":              folds,
-        "mean_oos_sharpe":    round(np.mean(sharpes),        4) if sharpes else 0,
-        "std_oos_sharpe":     round(np.std(sharpes),         4) if sharpes else 0,
-        "mean_excess_sharpe": round(np.mean(excess_sharpes), 4) if excess_sharpes else 0,
-        # pass = Sharpe threshold AND beating the equal-weight benchmark
-        "pass": bool(
-            np.mean(sharpes) >= 0.8 and np.mean(excess_sharpes) > 0.0
-        ) if sharpes else False,
+        "type":                "walk_forward",
+        "folds":               folds,
+        "mean_oos_sharpe":     mean_oos,
+        "std_oos_sharpe":      std_oos,
+        "mean_excess_sharpe":  mean_exc,
+        "oos_is_sharpe_ratio": oos_is_ratio,
+        "fold_pass_count":     fold_pass_count,
+        "pass":                passed,
+        "fail_reasons":        reasons_failed,
     }
 
 
@@ -429,10 +552,12 @@ def _log_result(result: dict, mode: str, description: str = "") -> None:
     import csv
 
     if mode == "walk_forward":
-        metrics = result.get("in_sample", {})
+        metrics = result.get("dev", {})
         oos_note = (
             f"[OOS sharpe={result.get('mean_oos_sharpe', '')} "
             f"excess={result.get('mean_excess_sharpe', '')} "
+            f"decay_ratio={result.get('oos_is_sharpe_ratio', '')} "
+            f"folds_passed={result.get('fold_pass_count', '')} "
             f"pass={result.get('pass', '')}]"
         )
         description = f"{oos_note} {description}".strip()
@@ -447,37 +572,59 @@ def _log_result(result: dict, mode: str, description: str = "") -> None:
                 "timestamp", "mode",
                 "sharpe", "max_drawdown", "annual_return", "turnover", "score",
                 "benchmark_sharpe", "excess_sharpe",
+                "dev_sharpe", "holdback_sharpe", "holdback_excess",
+                "holdback_gate_pass",
                 "description",
             ])
         writer.writerow([
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             mode,
-            metrics.get("sharpe", ""),
-            metrics.get("max_drawdown", ""),
-            metrics.get("annual_return", ""),
-            metrics.get("turnover", ""),
-            metrics.get("score", "") or "",
-            metrics.get("benchmark_sharpe", ""),
-            metrics.get("excess_sharpe", ""),
+            metrics.get("sharpe",           ""),
+            metrics.get("max_drawdown",      ""),
+            metrics.get("annual_return",     ""),
+            metrics.get("turnover",          ""),
+            metrics.get("score",             "") or "",
+            metrics.get("benchmark_sharpe",  ""),
+            metrics.get("excess_sharpe",     ""),
+            result.get("dev_sharpe",         ""),
+            result.get("holdback_sharpe",    ""),
+            result.get("holdback_excess",    ""),
+            result.get("holdback_gate_pass", ""),
             description,
         ])
 
 
-# ── Best-agent snapshot ───────────────────────────────────────────────────────
+# ── Best-agent snapshots ──────────────────────────────────────────────────────
+#
+# Two separate snapshot files with distinct purposes:
+#
+#   best_dev_agent.py      — highest DEV score seen so far, regardless of
+#                            holdback status. Updated after every --in-sample
+#                            run that sets a new DEV score high. Used to revert
+#                            within a hypothesis after a bad DEV experiment.
+#
+#   best_holdback_agent.py — highest DEV score among runs whose holdback gate
+#                            has explicitly passed. Updated only after a
+#                            successful --check-holdback. Used to revert after
+#                            a holdback failure or a walk-forward failure —
+#                            always points to a fully validated state.
 
-BEST_AGENT_FILE = AGENT_DIR / "best_agent.py"
+BEST_DEV_AGENT_FILE = AGENT_DIR / "best_dev_agent.py"
+BEST_HOLDBACK_AGENT_FILE = AGENT_DIR / "best_holdback_agent.py"
 
 
-def _save_best_if_new(mode: str) -> None:
+def _save_best_if_new(mode: str, result: dict) -> None:
     """
-    After each run, read results.csv and check whether the most recent
-    in-sample row is the all-time best by score. If so, snapshot the
-    current agent.py and write a summary to .agent/best_agent.py.
+    Maintain two independent agent snapshots after every scored run.
 
-    CSV is the single source of truth — no separate state file needed.
-    Walk-forward and holdout rows are ignored; only in_sample rows count.
+    best_dev_agent.py      — updated on --in-sample when DEV score improves.
+    best_holdback_agent.py — updated on --check-holdback when gate passes
+                             AND the DEV score of this run beats all previous
+                             holdback-validated runs.
     """
-    if mode != "in_sample":
+    import shutil
+
+    if mode not in ("in_sample", "check_holdback"):
         return
     if not RESULTS_CSV.exists():
         return
@@ -487,40 +634,74 @@ def _save_best_if_new(mode: str) -> None:
     except Exception:
         return
 
-    is_rows = df[df["mode"] == "in_sample"].copy()
-    if is_rows.empty:
-        return
+    def _float(val) -> float:
+        return round(float(pd.to_numeric(val, errors="coerce")), 4)
 
-    is_rows["score"] = pd.to_numeric(
-        is_rows["score"], errors="coerce").fillna(0)
-    is_rows["excess_sharpe"] = pd.to_numeric(
-        is_rows["excess_sharpe"], errors="coerce").fillna(0)
+    # ── 1. best_dev_agent.py — best DEV score, no holdback requirement ────────
+    if mode == "in_sample":
+        dev_rows = df[df["mode"] == "in_sample"].copy()
+        dev_rows["score"] = pd.to_numeric(
+            dev_rows["score"], errors="coerce").fillna(0)
 
-    best_idx = is_rows["score"].idxmax()
-    best_row = is_rows.loc[best_idx]
-    latest_row = is_rows.iloc[-1]
+        if not dev_rows.empty:
+            best_idx = dev_rows["score"].idxmax()
+            latest_idx = dev_rows.index[-1]
 
-    # Current run is the best if it matches the row with the highest score
-    if latest_row.name != best_idx:
-        return
+            if latest_idx == best_idx:
+                shutil.copy(Path(__file__), BEST_DEV_AGENT_FILE)
+                best_row = dev_rows.loc[best_idx]
+                summary = {
+                    "score":         _float(best_row["score"]),
+                    "sharpe":        _float(best_row.get("sharpe", 0)),
+                    "excess_sharpe": _float(best_row.get("excess_sharpe", 0)),
+                    "dev_sharpe":    _float(best_row.get("sharpe", 0)),
+                    "description":   str(best_row.get("description", "")),
+                    "timestamp":     str(best_row.get("timestamp", "")),
+                }
+                (AGENT_DIR / "best_dev_score.json").write_text(
+                    json.dumps(summary, indent=2))
+                print(f"  ✓ New best_dev_agent.py  "
+                      f"score={summary['score']:.4f}  "
+                      f"excess={summary['excess_sharpe']:+.4f}")
 
-    import shutil
-    shutil.copy(Path(__file__), BEST_AGENT_FILE)
+    # ── 2. best_holdback_agent.py — best holdback-validated DEV score ─────────
+    if mode == "check_holdback" and result.get("holdback_gate_pass", False):
+        hb_rows = df[df["mode"] == "check_holdback"].copy()
+        hb_rows["score"] = pd.to_numeric(
+            hb_rows["score"], errors="coerce").fillna(0)
 
-    summary = {
-        "score":         round(float(best_row["score"]), 4),
-        "excess_sharpe": round(float(best_row["excess_sharpe"]), 4),
-        "sharpe":        round(float(pd.to_numeric(best_row.get("sharpe", 0), errors="coerce")), 4),
-        "description":   str(best_row.get("description", "")),
-        "timestamp":     str(best_row.get("timestamp", "")),
-    }
+        # Only consider rows where the gate passed
+        hb_rows["holdback_gate_pass"] = (
+            hb_rows["holdback_gate_pass"].astype(str).str.lower())
+        passed_rows = hb_rows[hb_rows["holdback_gate_pass"] == "true"]
 
-    summary_path = AGENT_DIR / "best_score.json"
-    summary_path.write_text(json.dumps(summary, indent=2))
+        if not passed_rows.empty:
+            best_idx = passed_rows["score"].idxmax()
+            latest_idx = passed_rows.index[-1]
 
-    print(f"  ✓ New best → .agent/best_agent.py  "
-          f"score={summary['score']:.4f}  "
-          f"excess={summary['excess_sharpe']:+.4f}")
+            if latest_idx == best_idx:
+                shutil.copy(Path(__file__), BEST_HOLDBACK_AGENT_FILE)
+                best_row = passed_rows.loc[best_idx]
+                summary = {
+                    "score":            _float(best_row["score"]),
+                    "sharpe":           _float(best_row.get("sharpe", 0)),
+                    "excess_sharpe":    _float(best_row.get("excess_sharpe", 0)),
+                    "dev_sharpe":       _float(best_row.get("sharpe", 0)),
+                    "holdback_sharpe":  _float(best_row.get("holdback_sharpe", 0)),
+                    "holdback_excess":  _float(best_row.get("holdback_excess", 0)),
+                    "holdback_gate_pass": True,
+                    "description":      str(best_row.get("description", "")),
+                    "timestamp":        str(best_row.get("timestamp", "")),
+                }
+                (AGENT_DIR / "best_holdback_score.json").write_text(
+                    json.dumps(summary, indent=2))
+                # Also update best_score.json — used by walk-forward decay ratio
+                (AGENT_DIR / "best_score.json").write_text(
+                    json.dumps(summary, indent=2))
+                print(f"  ✓ New best_holdback_agent.py  "
+                      f"score={summary['score']:.4f}  "
+                      f"holdback_sharpe={summary['holdback_sharpe']:.4f}  "
+                      f"excess={summary['excess_sharpe']:+.4f}")
 
 
 # ── Single-run entry point ────────────────────────────────────────────────────
@@ -536,34 +717,76 @@ def run_once(mode: str = "in_sample", description: str = "") -> dict:
     sizes_fn = mod.get_position_sizes
 
     raw_data = load_data()
-    pit_data = select_universe(raw_data)        # FIX 1
-    insample, wf, holdout = three_way_split(pit_data)        # FIX 2
+    pit_data = select_universe(raw_data)
+    dev, holdback, wf, holdout = four_way_split(pit_data)
 
     if mode == "holdout":
-        print("⚠️  HOLDOUT eval — do not iterate after this.")
+        print("Running holdout eval (2022-2024)...")
         returns, weights = simulate(holdout, signals_fn, sizes_fn)
         bm_shr = benchmark_sharpe(benchmark_returns(holdout))
         result = compute_metrics(returns, weights, bm_sharpe=bm_shr)
         result["type"] = "holdout"
 
+        for label, start, end in [
+            ("bear_2022",      "2022-01-01", "2022-12-31"),
+            ("bull_2023_2024", "2023-01-01", "2024-12-31"),
+        ]:
+            sub = {
+                k: _slice(v, start, end) if isinstance(v, pd.DataFrame) else v
+                for k, v in holdout.items()
+            }
+            r_sub, w_sub = simulate(sub, signals_fn, sizes_fn)
+            bm_sub = benchmark_sharpe(benchmark_returns(sub))
+            result[label] = compute_metrics(r_sub, w_sub, bm_sharpe=bm_sub)
+
     elif mode == "walk_forward":
-        print("Running walk-forward (2019–2021, 3 folds)...")
-        result = walk_forward(insample, wf, signals_fn, sizes_fn)  # FIX 3
-        returns, weights = simulate(insample, signals_fn, sizes_fn)
-        bm_shr = benchmark_sharpe(benchmark_returns(insample))
-        result["in_sample"] = compute_metrics(
-            returns, weights, bm_sharpe=bm_shr)
+        print("Running walk-forward (2019-2021, 3 folds)...")
+        result = walk_forward(dev, wf, signals_fn, sizes_fn)
+
+        dev_ret, dev_wgt = simulate(dev, signals_fn, sizes_fn)
+        bm_shr = benchmark_sharpe(benchmark_returns(dev))
+        result["dev"] = compute_metrics(dev_ret, dev_wgt, bm_sharpe=bm_shr)
+
+    elif mode == "check_holdback":
+        # One-shot holdback gate — run only when agent is ready to commit
+        print("Running IS holdback gate check (2017-2018)...")
+        print("WARNING: This is a one-shot check. No re-checks allowed.")
+
+        dev_ret, dev_wgt = simulate(dev, signals_fn, sizes_fn)
+        dev_bm = benchmark_sharpe(benchmark_returns(dev))
+        dev_m = compute_metrics(dev_ret, dev_wgt, bm_sharpe=dev_bm)
+
+        gate = run_holdback_gate(pit_data, dev_m, signals_fn, sizes_fn)
+
+        result = {**dev_m, **gate}
+        result["type"] = "check_holdback"
+
+        print(f"  dev  sharpe={dev_m['sharpe']:.3f}  "
+              f"excess={dev_m['excess_sharpe']:+.3f}  "
+              f"score={dev_m['score']:.3f}")
 
     else:
-        print("Running in-sample backtest (2010–2018)...")
-        returns, weights = simulate(insample, signals_fn, sizes_fn)
-        bm_shr = benchmark_sharpe(benchmark_returns(insample))
-        result = compute_metrics(returns, weights, bm_sharpe=bm_shr)
-        result["type"] = "in_sample"
+        # --in-sample: DEV period only. Holdback is NOT evaluated.
+        print("Running dev backtest (2010-2016)...")
+        print("  [Holdback suppressed — use --check-holdback when ready to commit]")
 
-    LAST_RESULT.write_text(json.dumps(result, indent=2))
+        dev_ret, dev_wgt = simulate(dev, signals_fn, sizes_fn)
+        dev_bm = benchmark_sharpe(benchmark_returns(dev))
+        dev_m = compute_metrics(dev_ret, dev_wgt, bm_sharpe=dev_bm)
+
+        result = dev_m
+        result["type"] = "in_sample"
+        result["holdback_gate_pass"] = None   # not checked yet
+        result["holdback_sharpe"] = None
+        result["holdback_excess"] = None
+
+        print(f"  dev  sharpe={dev_m['sharpe']:.3f}  "
+              f"excess={dev_m['excess_sharpe']:+.3f}  "
+              f"score={dev_m['score']:.3f}")
+
+    LAST_RESULT.write_text(json.dumps(result, indent=2, default=str))
     _log_result(result, mode, description)
-    _save_best_if_new(mode)
+    _save_best_if_new(mode, result)
     return result
 
 
@@ -571,16 +794,20 @@ def run_once(mode: str = "in_sample", description: str = "") -> dict:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--walk-forward", action="store_true")
-    parser.add_argument("--holdout",      action="store_true")
-    parser.add_argument("--in-sample",    action="store_true")
+    parser.add_argument("--walk-forward",    action="store_true")
+    parser.add_argument("--holdout",         action="store_true")
+    parser.add_argument("--in-sample",       action="store_true")
+    parser.add_argument("--check-holdback",  action="store_true",
+                        help="One-shot holdback gate check — run once per hypothesis only")
     parser.add_argument("--desc", default="",
                         help="Short description logged to results.csv")
     args = parser.parse_args()
 
     if args.holdout:
-        print(json.dumps(run_once("holdout", args.desc), indent=2))
+        print(json.dumps(run_once("holdout",        args.desc), indent=2, default=str))
     elif args.walk_forward:
-        print(json.dumps(run_once("walk_forward", args.desc), indent=2))
+        print(json.dumps(run_once("walk_forward",   args.desc), indent=2, default=str))
+    elif args.check_holdback:
+        print(json.dumps(run_once("check_holdback", args.desc), indent=2, default=str))
     else:
-        print(json.dumps(run_once("in_sample", args.desc), indent=2))
+        print(json.dumps(run_once("in_sample",      args.desc), indent=2, default=str))
