@@ -47,47 +47,53 @@ import numpy as np
 # EDITABLE SECTION — meta-agent modifies only this section
 # ============================================================================
 
-def get_signals(data: dict) -> pd.DataFrame:
+def get_regime(data: dict) -> pd.Series:
     """
-    Generate entry signals.
+    Estimate market regime as a continuous scalar [0.0, 1.0].
+    1.0 = fully invested (bull), 0.0 = fully in cash (bear).
 
-    Args:
-        data: dict with keys close, high, low, volume, spy
-              all pd.DataFrame with shape (dates, tickers)
+    Uses SPY vs 200-day MA as the single regime signal —
+    the simplest and most robust starting point.
 
     Returns:
-        pd.DataFrame[bool] — True means long this stock today
+        pd.Series indexed by date
+    """
+    spy = data["spy"].squeeze()
+    spy_200d = spy.rolling(200).mean()
+
+    regime = pd.Series(
+        np.where(spy > spy_200d, 1.0, 0.0),
+        index=spy.index
+    )
+    return regime
+
+
+def get_signals(data: dict) -> pd.DataFrame:
+    """
+    Generate entry signals — stock selection only, no regime logic here.
     """
     close = data["close"]
-    spy = data["spy"].squeeze()   # DataFrame (N×1) → Series (N,)
 
     # 12-1 momentum: 12-month return, skip most recent month
     momentum = close.pct_change(252).shift(21)
     ranked = momentum.rank(axis=1, pct=True)
-    top_momentum = ranked > 0.90
+    signals = ranked > 0.90
 
-    # Market regime: only long when SPY is above its 200-day MA
-    spy_200d = spy.rolling(200).mean()
-    in_bull_market = spy > spy_200d
-
-    signals = top_momentum & in_bull_market.values.reshape(-1, 1)
     return signals.fillna(False)
 
 
 def get_position_sizes(signals: pd.DataFrame, data: dict) -> pd.DataFrame:
     """
-    Convert signals to portfolio weights.
-
-    Args:
-        signals: boolean DataFrame from get_signals()
-        data:    same data dict
-
-    Returns:
-        pd.DataFrame[float] — portfolio weights, rows must sum to <= 1.0
+    Convert signals to portfolio weights, scaled by regime.
     """
+    regime = get_regime(data)
+
     # Equal weight among selected stocks
     n_selected = signals.sum(axis=1).replace(0, np.nan)
     weights = signals.astype(float).div(n_selected, axis=0).fillna(0.0)
+
+    # Scale by regime — goes to cash when bear
+    weights = weights.mul(regime, axis=0)
     return weights
 
 
@@ -123,14 +129,14 @@ HOLDOUT_START = "2022-01-01"
 
 # Holdback gate thresholds (checked once per hypothesis)
 HOLDBACK_DECAY_MIN = 0.50   # holdback_sharpe >= this * dev_sharpe
-HOLDBACK_EXCESS_MIN = 0.10   # holdback_excess must exceed this
+HOLDBACK_EXCESS_MIN = 0.10  # holdback_excess must exceed this
 
 # Walk-forward pass thresholds
 WF_MEAN_SHARPE_MIN = 0.80
 WF_MEAN_EXCESS_MIN = 0.15
 WF_DECAY_RATIO_MIN = 0.50   # mean_oos_sharpe / dev_sharpe
 WF_FOLD_SHARPE_MIN = 0.60   # per-fold threshold for fold_pass_count
-WF_FOLD_PASS_MIN = 2      # number of folds that must clear WF_FOLD_SHARPE_MIN
+WF_FOLD_PASS_MIN = 2        # number of folds that must clear WF_FOLD_SHARPE_MIN
 
 TRANSACTION_COST = 0.0010
 ROOT = Path(__file__).parent
@@ -419,6 +425,29 @@ def compute_metrics(returns: pd.Series, weights: pd.DataFrame,
     }
 
 
+# ── Auto-revert ───────────────────────────────────────────────────────────────
+
+def _auto_revert(reason: str) -> None:
+    """
+    Revert agent.py to the last fully-validated state automatically.
+
+    Called on holdback failure or walk-forward failure. Eliminates the risk
+    of the agent forgetting to revert, or reverting to the wrong snapshot.
+
+    If best_holdback_agent.py does not yet exist (no hypothesis has ever
+    passed holdback), a clear error is printed instead of silently failing.
+    """
+    import shutil
+    if BEST_HOLDBACK_AGENT_FILE.exists():
+        shutil.copy(BEST_HOLDBACK_AGENT_FILE, Path(__file__))
+        print(f"  ↩ Auto-reverted to best_holdback_agent.py  ({reason})")
+        print("    Hypothesis permanently closed. Start a new hypothesis.")
+    else:
+        print(f"  ✗ Auto-revert skipped — best_holdback_agent.py does not exist yet.")
+        print(f"    No hypothesis has passed holdback. The current code is the only state.")
+        print(f"    Reason for attempted revert: {reason}")
+
+
 # ── Holdback gate (one-shot, explicit flag only) ──────────────────────────────
 
 def run_holdback_gate(pit_data: dict, dev_metrics: dict,
@@ -472,7 +501,7 @@ def run_holdback_gate(pit_data: dict, dev_metrics: dict,
     else:
         print(f"  ✗ Holdback gate FAILED: {'; '.join(reasons)}")
         print(
-            "  → Revert to best_holdback_agent.py. This hypothesis is permanently closed.")
+            "  → Auto-reverting to best_holdback_agent.py. This hypothesis is permanently closed.")
 
     return {
         "holdback_gate_pass":   gate_pass,
@@ -567,7 +596,7 @@ def walk_forward(dev: dict, wf: dict, signals_fn, sizes_fn,
 
     mean_oos = round(np.mean(sharpes),        4) if sharpes else 0
     mean_exc = round(np.mean(excess_sharpes), 4) if excess_sharpes else 0
-    std_oos = round(np.std(sharpes),         4) if sharpes else 0
+    std_oos = round(np.std(sharpes),          4) if sharpes else 0
 
     dev_sharpe_ref = 0.0
     best_score_path = AGENT_DIR / "best_score.json"
@@ -833,6 +862,10 @@ def run_once(mode: str = "in_sample", description: str = "") -> dict:
         bm_shr = benchmark_sharpe(benchmark_returns(dev))
         result["dev"] = compute_metrics(dev_ret, dev_wgt, bm_sharpe=bm_shr)
 
+        # Auto-revert if walk-forward failed
+        if not result.get("pass"):
+            _auto_revert("walk-forward failed — hypothesis permanently closed")
+
     elif mode == "check_holdback":
         # One-shot holdback gate — run only when agent is ready to commit
         print("Running IS holdback gate check (2017-2018)...")
@@ -850,6 +883,11 @@ def run_once(mode: str = "in_sample", description: str = "") -> dict:
         print(f"  dev  sharpe={dev_m['sharpe']:.3f}  "
               f"excess={dev_m['excess_sharpe']:+.3f}  "
               f"score={dev_m['score']:.3f}")
+
+        # Auto-revert if holdback gate failed
+        if not gate.get("holdback_gate_pass"):
+            _auto_revert(
+                "holdback gate failed — hypothesis permanently closed")
 
     else:
         # --in-sample: DEV period only. Holdback is NOT evaluated.
