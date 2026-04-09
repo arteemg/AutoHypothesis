@@ -24,8 +24,7 @@ It contains ONLY two functions — do not add anything else:
 ```
 
 **Asset class:** US equities (S&P 500 universe)
-**Universe:** Top 150 stocks by 30-day average dollar volume, selected from
-in-sample data (2010–2018) only — future liquidity never influences universe.
+**Universe:** Top 150 stocks by 30-day average dollar volume.
 **Development:** 2010–2016 (~1,760 trading days) — iterate freely here.
 **IS Holdback:** 2017–2018 (~504 trading days) — checked ONCE per hypothesis,
 never during parameter exploration within a hypothesis.
@@ -189,7 +188,7 @@ Walk-forward pass criteria — ALL must hold:
 
 After walk-forward:
 
-- PASS → freeze code as best, move to next hypothesis
+- PASS → freeze code as best, stop iterating.
 - FAIL → revert to `best_holdback_agent.py`, hypothesis permanently closed
 
 ### Step 6 — Repeat
