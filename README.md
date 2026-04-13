@@ -4,7 +4,7 @@
 ```
 agent.py
   ┌─────────────────────────────────────┐
-  │ EDITABLE SECTION                    │  ← meta-agent rewrites this
+  │ EDITABLE SECTION                    │  ← agent rewrites this
   │   get_signals(data)                 │
   │   get_position_sizes(signals, data) │
   │   get_regime(data)                  │
@@ -44,7 +44,7 @@ Read program.md and let's start a new experiment.
 
 ## the only file you edit
 `program.md` — change the research directive, the hypothesis space, or the
-target metrics. The meta-agent reads this to decide what to try.
+target metrics. The agent reads this to decide what to try.
 
 ## score formula
 ```
@@ -73,4 +73,4 @@ score = sharpe
 - **Different split**: change the date constants in the fixed section — this invalidates cross-experiment comparisons
 - **Larger universe**: change `UNIVERSE_SIZE` in the fixed section — this invalidates cross-experiment comparisons
 
-> ⚠️ Date constants and `UNIVERSE_SIZE` are in the **fixed section** and are intentionally not editable by the meta-agent. Changing them manually will invalidate comparisons across experiments.
+> ⚠️ Date constants and `UNIVERSE_SIZE` are in the **fixed section** and are intentionally not editable by the agent. Changing them manually will invalidate comparisons across experiments.
