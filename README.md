@@ -1,7 +1,7 @@
 <div align="center">
   <img src="docs/socrates.png" width="120">
 
-# autohypothesis
+# AutoHypothesis
 </div>
 
 ## structure
