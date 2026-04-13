@@ -1,7 +1,6 @@
 # autohypothesis
-Single-file autonomous quant strategy search. Faithful to the
-[autoagent](https://github.com/kevinrgu/autoagent) pattern — one file,
-one boundary, the meta-agent edits above it, the harness lives below it.
+
+single-file autonomous quant strategy search.
 
 ## structure
 ```
