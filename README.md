@@ -1,9 +1,9 @@
-# AutoHypothesis
+# autohypothesis
 Single-file autonomous quant strategy search. Faithful to the
 [autoagent](https://github.com/kevinrgu/autoagent) pattern — one file,
 one boundary, the meta-agent edits above it, the harness lives below it.
 
-## Structure
+## structure
 ```
 agent.py
   ┌─────────────────────────────────────┐
@@ -36,7 +36,7 @@ last_result.json    ← auto-generated, last backtest output
 .agent/best_holdback_agent.py ← best holdback-validated snapshot
 ```
 
-## Quick start
+## quick start
 ```bash
 pip install -e .
 
@@ -53,18 +53,18 @@ python agent.py --walk-forward --desc "hypothesis 1 walk-forward"
 python agent.py --holdout --desc "final holdout"
 ```
 
-## The only file you edit
+## the only file you edit
 `program.md` — change the research directive, the hypothesis space, or the
 target metrics. The meta-agent reads this to decide what to try.
 
-## Score formula
+## score formula
 ```
 score = sharpe
       - max(0, (turnover - 0.3) * 0.5)
       - max(0, (|max_drawdown| - 0.20) * 2)
 ```
 
-## Data split
+## data split
 | Period | Dates | Purpose |
 |---|---|---|
 | Development | 2010–2016 | Iterate freely |
@@ -72,13 +72,13 @@ score = sharpe
 | Walk-forward | 2019–2021 | One-shot validation per hypothesis |
 | Holdout | 2022–2024 | Locked until final run |
 
-## Stopping criteria
+## stopping criteria
 | Condition | Meaning |
 |---|---|
 | Walk-forward passes | Target achieved |
 | 200 iterations | Time limit |
 
-## Customizing
+## customizing
 - **Different asset class**: swap the tickers in `SP500_TICKERS` for ETFs, futures, crypto
 - **Different score formula**: edit `compute_metrics()` in the fixed section AND update `program.md`
 - **Different split**: change the date constants in the fixed section — this invalidates cross-experiment comparisons
