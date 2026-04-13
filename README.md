@@ -34,21 +34,11 @@ last_result.json    ← auto-generated, last backtest output
 ```
 
 ## quick start
-```bash
-pip install -e .
 
-# Establish baseline on DEV period
-python agent.py --in-sample --desc "baseline"
+Point your coding agent at the repo and prompt:
 
-# Holdback gate — run once per hypothesis when ready to commit
-python agent.py --check-holdback --desc "hypothesis 1 holdback check"
+`Read program.md and let's start a new experiment.`
 
-# Walk-forward — one shot per hypothesis
-python agent.py --walk-forward --desc "hypothesis 1 walk-forward"
-
-# Final holdout — run once, at the end only
-python agent.py --holdout --desc "final holdout"
-```
 
 ## the only file you edit
 `program.md` — change the research directive, the hypothesis space, or the
