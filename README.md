@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/socrates.png" width="120">
+  <img src="docs/socrates.png" width="60">
 </div>
 
 # autohypothesis
