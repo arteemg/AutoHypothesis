@@ -2,7 +2,7 @@
   <img src="docs/socrates.png" width="120">
 
 # AutoHypothesis 
-framework for autonomous quant finance research
+ an open-source agentic framework for autonomous quant finance research
 </div>
 
 ## structure
