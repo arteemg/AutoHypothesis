@@ -1,4 +1,4 @@
-# autohypothesis  <img src="docs/socrates.png" width="30" align="right" style="margin-left: 16px;">
+# autohypothesis  <img src="docs/socrates.png" width="50" align="right" style="margin-left: 16px;">
 
 
 ## structure
