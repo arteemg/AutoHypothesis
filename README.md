@@ -37,7 +37,9 @@ last_result.json    ← auto-generated, last backtest output
 
 Point your coding agent at the repo and prompt:
 
-```Read program.md and let's start a new experiment.```
+```
+Read program.md and let's start a new experiment.
+```
 
 
 ## the only file you edit
