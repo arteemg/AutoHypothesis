@@ -1,5 +1,8 @@
-# autohypothesis  <img src="docs/socrates.png" width="80" align="right" style="margin-left: 16px;">
+<div align="center">
+  <img src="docs/socrates.png" width="120">
+</div>
 
+# autohypothesis
 
 ## structure
 ```
