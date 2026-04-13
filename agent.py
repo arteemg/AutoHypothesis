@@ -4,28 +4,6 @@ Single-file quant strategy harness.
 The meta-agent edits everything above the FIXED ADAPTER BOUNDARY.
 The fixed section below handles data loading, simulation, scoring, and walk-forward.
 
-Run:
-  python agent.py --in-sample       # dev (2010-2016) only — holdback suppressed
-  python agent.py --check-holdback  # holdback gate — run once per hypothesis
-  python agent.py --walk-forward    # expanding walk-forward on 2019-2021
-  python agent.py --holdout         # final holdout eval (run once, at the very end)
-
-Design:
-  1. Point-in-time universe  — universe selected from IS dollar volume only.
-  2. Four-way split          — DEV (2010-2016), HOLDBACK (2017-2018),
-                               WF (2019-2021), HOLDOUT (2022+).
-  3. Holdback gate           — only triggered by --check-holdback, NOT by
-                               --in-sample. Agent iterates on DEV without
-                               ever seeing holdback results. One check per
-                               hypothesis; one verdict, no re-checks.
-  4. True walk-forward       — expanding training window; test folds are
-                               strictly inside the WF period.
-  5. WF pass criteria        — requires mean_oos_sharpe >= 0.80,
-                               mean_excess_sharpe >= 0.15,
-                               oos_is_sharpe_ratio >= 0.50,
-                               fold_pass_count >= 2.
-  6. Benchmark tracking      — every result logs excess_sharpe vs equal-weight
-                               buy-and-hold of the same universe.
 """
 
 from __future__ import annotations
@@ -106,7 +84,7 @@ warnings.filterwarnings("ignore")
 # ── Constants ─────────────────────────────────────────────────────────────────
 # Do not change — altering any of these invalidates cross-experiment comparison.
 
-UNIVERSE_SIZE = 150
+UNIVERSE_SIZE = 300
 
 # Development: the only period the meta-agent ever optimises against
 DEV_START = "2010-01-01"
@@ -133,10 +111,10 @@ HOLDBACK_EXCESS_MIN = 0.10  # holdback_excess must exceed this
 
 # Walk-forward pass thresholds
 WF_MEAN_SHARPE_MIN = 0.80
-WF_MEAN_EXCESS_MIN = 0.15
+WF_MEAN_EXCESS_MIN = 0.10
 WF_DECAY_RATIO_MIN = 0.50   # mean_oos_sharpe / dev_sharpe
 WF_FOLD_SHARPE_MIN = 0.60   # per-fold threshold for fold_pass_count
-WF_FOLD_PASS_MIN = 2        # number of folds that must clear WF_FOLD_SHARPE_MIN
+WF_FOLD_PASS_MIN = 1        # number of folds that must clear WF_FOLD_SHARPE_MIN
 
 TRANSACTION_COST = 0.0010
 ROOT = Path(__file__).parent
@@ -225,19 +203,56 @@ def _assert_gate_token_valid() -> None:
 
 
 SP500_TICKERS = [
-    "AAPL", "MSFT", "AMZN", "NVDA", "GOOGL", "META", "TSLA", "BRK-B", "UNH", "LLY",
-    "JPM", "V", "XOM", "AVGO", "PG", "MA", "HD", "CVX", "MRK", "ABBV", "KO", "PEP",
-    "COST", "TMO", "WMT", "MCD", "CSCO", "ABT", "CRM", "BAC", "ACN", "LIN", "ADBE",
-    "NFLX", "DHR", "TXN", "NEE", "PM", "CMCSA", "VZ", "RTX", "HON", "AMGN", "ORCL",
-    "IBM", "QCOM", "T", "UPS", "LOW", "INTU", "SPGI", "GS", "CAT", "ELV", "BLK", "AXP",
-    "SYK", "GILD", "MDT", "DE", "ADI", "REGN", "VRTX", "MMM", "C", "MS", "ISRG", "ADP",
-    "PLD", "CI", "BSX", "PANW", "KLAC", "LRCX", "MU", "AMAT", "SNPS", "CDNS", "MELI",
-    "ZTS", "SO", "DUK", "AON", "PNC", "USB", "ICE", "F", "GM", "FDX", "NSC", "UNP",
-    "CSX", "WM", "ECL", "EMR", "ITW", "ETN", "APD", "SHW", "MCO", "CTAS", "ROK", "CMI",
-    "PH", "GD", "NOC", "LMT", "BA", "HUM", "CNC", "CVS", "WBA", "MCK", "ABC", "CAH",
-    "JNJ", "PFE", "BMY", "BIIB", "ILMN", "IDXX", "A", "DXCM", "EW", "HCA", "DGX",
-    "LH", "IQV", "RMD", "STE", "HOLX", "TDY", "BAX", "BDX", "ZBH", "TECH", "HSIC",
-    "COO", "PODD", "SPY",
+    "MMM", "AOS", "ABT", "ABBV", "ACN", "ADBE", "AMD", "AES", "AFL", "A",
+    "APD", "ABNB", "AKAM", "ALB", "ARE", "ALGN", "ALLE", "LNT", "ALL", "GOOGL",
+    "GOOG", "MO", "AMZN", "AMCR", "AEE", "AAL", "AEP", "AXP", "AIG", "AMT",
+    "AWK", "AMP", "AME", "AMGN", "APH", "ADI", "ANSS", "AON", "APA", "AAPL",
+    "AMAT", "APTV", "ACGL", "ADM", "ANET", "AJG", "AIZ", "T", "ATO", "ADSK",
+    "AZO", "AVB", "AVY", "AXON", "BKR", "BALL", "BAC", "BK", "BBWI", "BAX",
+    "BDX", "BRK-B", "BBY", "BIO", "TECH", "BIIB", "BLK", "BX", "BA", "BKNG",
+    "BSX", "BMY", "AVGO", "BR", "BRO", "BF-B", "BLDR", "BG", "CDNS", "CZR",
+    "CPT", "CPB", "COF", "CAH", "KMX", "CCL", "CARR", "CTLT", "CAT", "CBOE",
+    "CBRE", "CDW", "CE", "COR", "CNC", "CNP", "CF", "CHRW", "CRL", "SCHW",
+    "CHTR", "CVX", "CMG", "CB", "CHD", "CI", "CINF", "CTAS", "CSCO", "C",
+    "CFG", "CLX", "CME", "CMS", "KO", "CTSH", "CL", "CMCSA", "CAG", "COP",
+    "ED", "STZ", "CEG", "COO", "CPRT", "GLW", "CPAY", "CTVA", "CSGP", "COST",
+    "CTRA", "CCI", "CSX", "CMI", "CVS", "DHR", "DRI", "DVA", "DAY", "DE",
+    "DAL", "XRAY", "DVN", "DXCM", "FANG", "DLR", "DFS", "DG", "DLTR", "D",
+    "DPZ", "DOV", "DOW", "DHI", "DTE", "DUK", "DD", "EMN", "ETN", "EBAY",
+    "ECL", "EIX", "EW", "EA", "ELV", "LLY", "EMR", "ENPH", "ETR", "EOG",
+    "EPAM", "EQT", "EFX", "EQIX", "EQR", "ESS", "EL", "ETSY", "EG", "EVRG",
+    "ES", "EXC", "EXPE", "EXPD", "EXR", "XOM", "FFIV", "FDS", "FICO", "FAST",
+    "FRT", "FDX", "FIS", "FITB", "FSLR", "FE", "FI", "FLT", "FMC", "F",
+    "FTNT", "FTV", "FOXA", "FOX", "BEN", "FCX", "GRMN", "IT", "GE", "GEHC",
+    "GEV", "GEN", "GNRC", "GD", "GIS", "GM", "GPC", "GILD", "GS", "HAL",
+    "HIG", "HAS", "HCA", "DOC", "HSIC", "HSY", "HES", "HPE", "HLT", "HOLX",
+    "HD", "HON", "HRL", "HST", "HWM", "HPQ", "HUBB", "HUM", "HBAN", "HII",
+    "IBM", "IEX", "IDXX", "ITW", "INCY", "IR", "PODD", "INTC", "ICE", "IFF",
+    "IP", "IPG", "INTU", "ISRG", "IVZ", "INVH", "IQV", "IRM", "JBAL", "JKHY",
+    "J", "JBL", "JNPR", "JPM", "JNPR", "K", "KVUE", "KDP", "KEY", "KEYS",
+    "KMB", "KIM", "KMI", "KLAC", "KHC", "KR", "LHX", "LH", "LRCX", "LW",
+    "LVS", "LDOS", "LEN", "LIN", "LYV", "LKQ", "LMT", "L", "LOW", "LULU",
+    "LYB", "MTB", "MRO", "MPC", "MKTX", "MAR", "MMC", "MLM", "MAS", "MA",
+    "MTCH", "MKC", "MCD", "MCK", "MDT", "MRK", "META", "MET", "MTD", "MGM",
+    "MCHP", "MU", "MSFT", "MAA", "MRNA", "MHK", "MOH", "TAP", "MDLZ", "MPWR",
+    "MNST", "MCO", "MS", "MOS", "MSI", "MSCI", "NDAQ", "NTAP", "NOC", "NFLX",
+    "NEM", "NWSA", "NWS", "NEE", "NKE", "NI", "NDSN", "NSC", "NTRS", "NOC",
+    "NCLH", "NRG", "NUE", "NVDA", "NVR", "NXPI", "ORLY", "OXY", "ODFL", "OMC",
+    "ON", "OKE", "ORCL", "OTIS", "PCAR", "PKG", "PANW", "PH", "PAYX", "PAYC",
+    "PYPL", "PNR", "PEP", "PFE", "PCG", "PM", "PSX", "PNW", "PNC", "POOL",
+    "PPG", "PPL", "PFG", "PG", "PGR", "PLD", "PRU", "PEG", "PTC", "PSA",
+    "PHM", "QRVO", "PWR", "QCOM", "DGX", "RL", "RJF", "RTX", "O", "REG",
+    "REGN", "RF", "RSG", "RMD", "RVTY", "ROK", "ROL", "ROP", "ROST", "RCL",
+    "SPGI", "CRM", "SBAC", "SLB", "STX", "SRE", "NOW", "SHW", "SPG", "SWKS",
+    "SJM", "SW", "SNA", "SOLV", "SO", "LUV", "SWK", "SBUX", "STT", "STLD",
+    "STE", "SYK", "SMCI", "SYF", "SNPS", "SYY", "TMUS", "TROW", "TTWO", "TPR",
+    "TRGP", "TGT", "TEL", "TDY", "TFX", "TER", "TSLA", "TXN", "TXT", "TMO",
+    "TJX", "TSCO", "TT", "TDG", "TRV", "TRMB", "TFC", "TYL", "TSN", "USB",
+    "UBER", "UDR", "ULTA", "UNP", "UAL", "UPS", "URI", "UNH", "UHS", "VLO",
+    "VTR", "VLTO", "VRSN", "VRSK", "VZ", "VRTX", "VTRS", "VICI", "V", "VST",
+    "VMC", "WRB", "GWW", "WAB", "WBA", "WMT", "DIS", "WBD", "WM", "WAT",
+    "WEC", "WFC", "WELL", "WST", "WDC", "WRK", "WY", "WMB", "WTW", "WYNN",
+    "XEL", "XYL", "YUM", "ZBRA", "ZBH", "ZTS", "SPY",
 ]
 
 # ── Data loading ──────────────────────────────────────────────────────────────

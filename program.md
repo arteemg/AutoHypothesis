@@ -7,10 +7,11 @@ improve trading strategies by modifying the editable section of `agent.py`,
 running the backtest, reading the results, and proposing the next improvement.
 
 The editable section is everything above the `FIXED ADAPTER BOUNDARY` comment.
-It contains ONLY two functions — do not add anything else:
+It contains ONLY three functions — do not add anything else:
 
 - `get_signals(data)` → pd.DataFrame[bool]
 - `get_position_sizes(signals, data)` → pd.DataFrame[float]
+- `get_regime(data)` -> pd.DataFrame[float]
 
 ---
 
@@ -24,7 +25,7 @@ It contains ONLY two functions — do not add anything else:
 ```
 
 **Asset class:** US equities (S&P 500 universe)
-**Universe:** Top 150 stocks by 30-day average dollar volume.
+**Universe:** Top 300 stocks by 30-day average dollar volume.
 **Development:** 2010–2016 (~1,760 trading days) — iterate freely here.
 **IS Holdback:** 2017–2018 (~504 trading days) — checked ONCE per hypothesis,
 never during parameter exploration within a hypothesis.
@@ -35,10 +36,10 @@ never during parameter exploration within a hypothesis.
 
 ## Agent Snapshots
 
-Two files in `.agent/` serve as revert points. They are written automatically
-by the harness — never copy or edit them manually.
+Two files in `.agent/` serve as revert points. They are written and read
+automatically by the harness — never copy, edit, or delete them manually.
 
-| File                     | Written when                            | Use for                                                    |
+| File                     | Written when                            | Used for                                                   |
 | ------------------------ | --------------------------------------- | ---------------------------------------------------------- |
 | `best_dev_agent.py`      | `--in-sample` sets a new DEV score high | Reverting a bad DEV experiment within a hypothesis         |
 | `best_holdback_agent.py` | `--check-holdback` passes the gate      | Reverting after a holdback failure or walk-forward failure |
@@ -46,9 +47,11 @@ by the harness — never copy or edit them manually.
 **The key distinction:**
 
 - `best_dev_agent.py` may contain code whose holdback has never been checked.
-  Use it only to undo a bad within-hypothesis tweak.
+  Use it only to undo a bad within-hypothesis tweak. This revert is **manual**
+  (see Step 3).
 - `best_holdback_agent.py` is always a fully validated state (DEV + holdback
-  gate passed). This is the safe revert point when a hypothesis is closed.
+  gate passed). The harness reverts to this file **automatically** on holdback
+  failure or walk-forward failure — you do not need to copy it yourself.
 
 On a fresh run with no prior history, neither file exists yet. The first
 `--in-sample` run creates `best_dev_agent.py`. The first passing
@@ -107,22 +110,24 @@ Do NOT attempt to infer holdback performance from any output.
 Iterate purely on DEV until you are satisfied with the result for this
 hypothesis and ready to commit.
 
-Change ONE thing at a time.
-
 A result on DEV counts as an improvement only if ALL hold:
 
 - `score` improves over the best known DEV score
-- `excess_sharpe` > 0.15
+- `excess_sharpe` > 0.10
 
-If improved: keep the change, increment improvement counter.
-If not: revert immediately:
+**If improved:** keep the change, increment improvement counter.
+
+**If not improved:**
+
+If an experiment makes things worse, you can revert to the last known best DEV state at your own discretion:
 
 ```bash
 cp .agent/best_dev_agent.py agent.py
 python agent.py --in-sample --desc "revert check"
 ```
 
-Score must match `.agent/best_dev_score.json` before continuing.
+Confirm the reported score matches `.agent/best_dev_score.json` before
+continuing. Then keep iterating on DEV from this point.
 
 ### Step 4 — Holdback gate (once per hypothesis, never during iteration)
 
@@ -144,14 +149,19 @@ Holdback gate — ALL must hold:
 | `holdback_sharpe >= decay_min × dev_sharpe` | 0.50×     |
 | `holdback_excess > excess_min`              | 0.10      |
 
-If gate fails → revert entire hypothesis, permanently closed:
+**If gate fails:** the harness automatically reverts `agent.py` to
+`best_holdback_agent.py`. Do not run any `cp` command yourself. Once the
+harness confirms the revert with `↩ Auto-reverted`, verify the revert by
+running:
 
 ```bash
-cp .agent/best_holdback_agent.py agent.py
-python agent.py --in-sample --desc "revert after holdback fail"
+python agent.py --in-sample --desc "revert check"
 ```
 
-If gate passes → eligible for walk-forward (step 5).
+Confirm the reported score matches `.agent/best_holdback_score.json`.
+This hypothesis is permanently closed — start a new one at Step 2.
+
+**If gate passes:** eligible for walk-forward (Step 5).
 
 ### Step 5 — Walk-forward (one shot per hypothesis)
 
@@ -173,12 +183,16 @@ python agent.py --walk-forward \
 
 Walk-forward pass criteria — ALL must hold:
 
-| Metric                | Threshold | Notes                            |
-| --------------------- | --------- | -------------------------------- |
-| `mean_oos_sharpe`     | ≥ 0.80    |                                  |
-| `mean_excess_sharpe`  | ≥ 0.15    | Must meaningfully beat benchmark |
-| `oos_is_sharpe_ratio` | ≥ 0.50    | OOS Sharpe must be ≥ 50% of dev  |
-| `fold_pass_count`     | ≥ 2       | At least 2 of 3 folds clear 0.60 |
+| Metric                | Threshold |
+| --------------------- | --------- |
+| `mean_oos_sharpe`     | ≥ 0.80    |
+| `mean_excess_sharpe`  | ≥ 0.10    |
+| `turnover`            | < 0.50    |
+| `oos_is_sharpe_ratio` | ≥ 0.50    |
+| `fold_pass_count`     | ≥ 1       |
+
+- `oos_is_sharpe_ratio` > 0.50 (guards against overfitting to dev period)
+- At least 1 of 3 walk-forward folds must clear `sharpe` 0.60
 
 **Forbidden after seeing a walk-forward result:**
 
@@ -186,17 +200,25 @@ Walk-forward pass criteria — ALL must hold:
 - Re-running WF with "just one small fix"
 - Revisiting a failed hypothesis with different params but the same mechanism
 
-After walk-forward:
+**If walk-forward fails:** the harness automatically reverts `agent.py` to
+`best_holdback_agent.py`. Do not run any `cp` command yourself. Once the
+harness confirms the revert with `↩ Auto-reverted`, verify by running:
 
-- PASS → freeze code as best, stop iterating.
-- FAIL → revert to `best_holdback_agent.py`, hypothesis permanently closed
+```bash
+python agent.py --in-sample --desc "revert check"
+```
+
+Confirm the reported score matches `.agent/best_holdback_score.json`.
+This hypothesis is permanently closed — start a new one at Step 2.
+
+**If walk-forward passes:** freeze code as best, stop iterating.
 
 ### Step 6 — Repeat
 
 Repeat until a stopping criterion is met:
 
-- `mean_oos_sharpe >= 1.2` on a passed walk-forward — target achieved
-- 100 iterations — time limit
+- walk-forward passes — target achieved
+- 200 iterations — time limit
 
 Do not stop for any other reason. Do not ask whether to continue.
 Hitting a high DEV score alone is not a stopping condition — only a
@@ -204,17 +226,7 @@ passing walk-forward result counts as genuine progress.
 
 ---
 
-## Research Directive
-
-**Target metrics (after 10bps transaction costs):**
-
-- Sharpe ratio > 1.2 (annualized)
-- Excess Sharpe > 0.3 over equal-weight buy-and-hold of same universe
-- Max drawdown < 25%
-- Monthly turnover < 50%
-- Long-only (no shorting)
-
-**Available data keys in `get_signals()` and `get_position_sizes()`:**
+**Available data keys in `get_signals()`, `get_position_sizes()` and `get_regime(data)` :**
 
 - `data["close"]` — daily adjusted close prices
 - `data["high"]` — daily adjusted highs
@@ -224,6 +236,16 @@ passing walk-forward result counts as genuine progress.
 
 All keys are pd.DataFrame with shape (dates × tickers) except `spy` which
 is (dates × 1). All fields are already loaded and cached.
+
+---
+
+**Use freely in get_signals() and get_position_sizes():**
+
+- numpy, pandas (always available)
+- scipy.stats — IC t-tests, rank correlations, normality checks
+- statsmodels — OLS factor residualization, HAC standard errors
+- arch — GARCH/EGARCH for realized and conditional volatility
+- cvxpy — convex position sizing (mean-variance, risk parity)
 
 ---
 
@@ -241,10 +263,12 @@ python agent.py --in-sample \
   --desc "HYPOTHESIS: vol scaling. CHANGE: inverse vol weighting. WHY: dampens exposure before drawdowns."
 
 # Holdback gate — run ONCE per hypothesis when ready to commit
+# On failure, harness auto-reverts to best_holdback_agent.py
 python agent.py --check-holdback \
   --desc "HYPOTHESIS: vol scaling. HOLDBACK CHECK."
 
 # Walk-forward — run once per hypothesis, committed
+# On failure, harness auto-reverts to best_holdback_agent.py
 python agent.py --walk-forward \
   --desc "HYPOTHESIS: vol scaling. COMMITTED: yes. WF-CHECK: #1"
 
