@@ -1,7 +1,8 @@
 <div align="center">
   <img src="docs/socrates.png" width="120">
 
-# AutoHypothesis
+# AutoHypothesis 
+framework for autonomous quant finance research
 </div>
 
 ## structure
@@ -39,7 +40,7 @@ last_result.json    ← auto-generated, last backtest output
 
 ## quick start
 
-Point your coding agent at the repo and prompt:
+Point your agent at the repo and prompt:
 
 ```
 Read program.md and let's start a new experiment.
