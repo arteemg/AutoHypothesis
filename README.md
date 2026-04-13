@@ -1,7 +1,4 @@
-<div align="center">
-  <img src="docs/socrates.png" width="60">
-</div>
-
+<div align="center"><img src="docs/socrates.png" width="120"></div>
 # autohypothesis
 
 ## structure
