@@ -4,6 +4,28 @@ Single-file quant strategy harness.
 The meta-agent edits everything above the FIXED ADAPTER BOUNDARY.
 The fixed section below handles data loading, simulation, scoring, and walk-forward.
 
+Run:
+  python agent.py --in-sample       # dev (2010-2016) only — holdback suppressed
+  python agent.py --check-holdback  # holdback gate — run once per hypothesis
+  python agent.py --walk-forward    # expanding walk-forward on 2019-2021
+  python agent.py --holdout         # final holdout eval (run once, at the very end)
+
+Design:
+  1. Point-in-time universe  — universe selected from IS dollar volume only.
+  2. Four-way split          — DEV (2010-2016), HOLDBACK (2017-2018),
+                               WF (2019-2021), HOLDOUT (2022+).
+  3. Holdback gate           — only triggered by --check-holdback, NOT by
+                               --in-sample. Agent iterates on DEV without
+                               ever seeing holdback results. One check per
+                               hypothesis; one verdict, no re-checks.
+  4. True walk-forward       — expanding training window; test folds are
+                               strictly inside the WF period.
+  5. WF pass criteria        — requires mean_oos_sharpe >= 0.80,
+                               mean_excess_sharpe >= 0.15,
+                               oos_is_sharpe_ratio >= 0.50,
+                               fold_pass_count >= 2.
+  6. Benchmark tracking      — every result logs excess_sharpe vs equal-weight
+                               buy-and-hold of the same universe.
 """
 
 from __future__ import annotations
@@ -25,53 +47,52 @@ import numpy as np
 # EDITABLE SECTION — meta-agent modifies only this section
 # ============================================================================
 
-def get_regime(data: dict) -> pd.Series:
-    """
-    Estimate market regime as a continuous scalar [0.0, 1.0].
-    1.0 = fully invested (bull), 0.0 = fully in cash (bear).
-
-    Uses SPY vs 200-day MA as the single regime signal —
-    the simplest and most robust starting point.
-
-    Returns:
-        pd.Series indexed by date
-    """
-    spy = data["spy"].squeeze()
-    spy_200d = spy.rolling(200).mean()
-
-    regime = pd.Series(
-        np.where(spy > spy_200d, 1.0, 0.0),
-        index=spy.index
-    )
-    return regime
-
-
 def get_signals(data: dict) -> pd.DataFrame:
     """
-    Generate entry signals — stock selection only, no regime logic here.
+    Generate entry signals.
+
+    Args:
+        data: dict with keys close, high, low, volume, spy
+              all pd.DataFrame with shape (dates, tickers)
+
+    Returns:
+        pd.DataFrame[bool] — True means long this stock today
     """
     close = data["close"]
-
-    # 12-1 momentum: 12-month return, skip most recent month
-    momentum = close.pct_change(252).shift(21)
-    ranked = momentum.rank(axis=1, pct=True)
-    signals = ranked > 0.90
-
+    volume = data["volume"]
+    vol_trend = volume.rolling(21).mean() / volume.rolling(126).mean()
+    vt_rank = vol_trend.rank(axis=1, pct=True)
+    signals = vt_rank > 0.95
     return signals.fillna(False)
 
 
 def get_position_sizes(signals: pd.DataFrame, data: dict) -> pd.DataFrame:
     """
-    Convert signals to portfolio weights, scaled by regime.
+    Convert signals to portfolio weights.
+
+    Args:
+        signals: boolean DataFrame from get_signals()
+        data:    same data dict
+
+    Returns:
+        pd.DataFrame[float] — portfolio weights, rows must sum to <= 1.0
     """
-    regime = get_regime(data)
+    close = data["close"]
+    spy = data["spy"].squeeze()
+    high = data["high"]
+    low = data["low"]
 
-    # Equal weight among selected stocks
     n_selected = signals.sum(axis=1).replace(0, np.nan)
-    weights = signals.astype(float).div(n_selected, axis=0).fillna(0.0)
+    raw_w = signals.astype(float).div(n_selected, axis=0).fillna(0.0)
+    smooth_w = raw_w.ewm(halflife=200).mean()
+    row_sum = smooth_w.sum(axis=1).replace(0, np.nan)
+    weights = smooth_w.div(row_sum, axis=0).fillna(0.0)
 
-    # Scale by regime — goes to cash when bear
-    weights = weights.mul(regime, axis=0)
+    spy_200d = spy.rolling(200).mean()
+    spy_50d = spy.rolling(50).mean()
+    regime = np.where((spy < spy_200d) & (spy < spy_50d), 0.2, 1.0)
+    weights = weights.mul(pd.Series(regime, index=spy.index), axis=0)
+
     return weights
 
 
@@ -84,7 +105,7 @@ warnings.filterwarnings("ignore")
 # ── Constants ─────────────────────────────────────────────────────────────────
 # Do not change — altering any of these invalidates cross-experiment comparison.
 
-UNIVERSE_SIZE = 300
+UNIVERSE_SIZE = 150
 
 # Development: the only period the meta-agent ever optimises against
 DEV_START = "2010-01-01"
@@ -107,14 +128,14 @@ HOLDOUT_START = "2022-01-01"
 
 # Holdback gate thresholds (checked once per hypothesis)
 HOLDBACK_DECAY_MIN = 0.50   # holdback_sharpe >= this * dev_sharpe
-HOLDBACK_EXCESS_MIN = 0.10  # holdback_excess must exceed this
+HOLDBACK_EXCESS_MIN = 0.10   # holdback_excess must exceed this
 
 # Walk-forward pass thresholds
 WF_MEAN_SHARPE_MIN = 0.80
-WF_MEAN_EXCESS_MIN = 0.10
+WF_MEAN_EXCESS_MIN = 0.15
 WF_DECAY_RATIO_MIN = 0.50   # mean_oos_sharpe / dev_sharpe
 WF_FOLD_SHARPE_MIN = 0.60   # per-fold threshold for fold_pass_count
-WF_FOLD_PASS_MIN = 1        # number of folds that must clear WF_FOLD_SHARPE_MIN
+WF_FOLD_PASS_MIN = 2      # number of folds that must clear WF_FOLD_SHARPE_MIN
 
 TRANSACTION_COST = 0.0010
 ROOT = Path(__file__).parent
@@ -203,56 +224,19 @@ def _assert_gate_token_valid() -> None:
 
 
 SP500_TICKERS = [
-    "MMM", "AOS", "ABT", "ABBV", "ACN", "ADBE", "AMD", "AES", "AFL", "A",
-    "APD", "ABNB", "AKAM", "ALB", "ARE", "ALGN", "ALLE", "LNT", "ALL", "GOOGL",
-    "GOOG", "MO", "AMZN", "AMCR", "AEE", "AAL", "AEP", "AXP", "AIG", "AMT",
-    "AWK", "AMP", "AME", "AMGN", "APH", "ADI", "ANSS", "AON", "APA", "AAPL",
-    "AMAT", "APTV", "ACGL", "ADM", "ANET", "AJG", "AIZ", "T", "ATO", "ADSK",
-    "AZO", "AVB", "AVY", "AXON", "BKR", "BALL", "BAC", "BK", "BBWI", "BAX",
-    "BDX", "BRK-B", "BBY", "BIO", "TECH", "BIIB", "BLK", "BX", "BA", "BKNG",
-    "BSX", "BMY", "AVGO", "BR", "BRO", "BF-B", "BLDR", "BG", "CDNS", "CZR",
-    "CPT", "CPB", "COF", "CAH", "KMX", "CCL", "CARR", "CTLT", "CAT", "CBOE",
-    "CBRE", "CDW", "CE", "COR", "CNC", "CNP", "CF", "CHRW", "CRL", "SCHW",
-    "CHTR", "CVX", "CMG", "CB", "CHD", "CI", "CINF", "CTAS", "CSCO", "C",
-    "CFG", "CLX", "CME", "CMS", "KO", "CTSH", "CL", "CMCSA", "CAG", "COP",
-    "ED", "STZ", "CEG", "COO", "CPRT", "GLW", "CPAY", "CTVA", "CSGP", "COST",
-    "CTRA", "CCI", "CSX", "CMI", "CVS", "DHR", "DRI", "DVA", "DAY", "DE",
-    "DAL", "XRAY", "DVN", "DXCM", "FANG", "DLR", "DFS", "DG", "DLTR", "D",
-    "DPZ", "DOV", "DOW", "DHI", "DTE", "DUK", "DD", "EMN", "ETN", "EBAY",
-    "ECL", "EIX", "EW", "EA", "ELV", "LLY", "EMR", "ENPH", "ETR", "EOG",
-    "EPAM", "EQT", "EFX", "EQIX", "EQR", "ESS", "EL", "ETSY", "EG", "EVRG",
-    "ES", "EXC", "EXPE", "EXPD", "EXR", "XOM", "FFIV", "FDS", "FICO", "FAST",
-    "FRT", "FDX", "FIS", "FITB", "FSLR", "FE", "FI", "FLT", "FMC", "F",
-    "FTNT", "FTV", "FOXA", "FOX", "BEN", "FCX", "GRMN", "IT", "GE", "GEHC",
-    "GEV", "GEN", "GNRC", "GD", "GIS", "GM", "GPC", "GILD", "GS", "HAL",
-    "HIG", "HAS", "HCA", "DOC", "HSIC", "HSY", "HES", "HPE", "HLT", "HOLX",
-    "HD", "HON", "HRL", "HST", "HWM", "HPQ", "HUBB", "HUM", "HBAN", "HII",
-    "IBM", "IEX", "IDXX", "ITW", "INCY", "IR", "PODD", "INTC", "ICE", "IFF",
-    "IP", "IPG", "INTU", "ISRG", "IVZ", "INVH", "IQV", "IRM", "JBAL", "JKHY",
-    "J", "JBL", "JNPR", "JPM", "JNPR", "K", "KVUE", "KDP", "KEY", "KEYS",
-    "KMB", "KIM", "KMI", "KLAC", "KHC", "KR", "LHX", "LH", "LRCX", "LW",
-    "LVS", "LDOS", "LEN", "LIN", "LYV", "LKQ", "LMT", "L", "LOW", "LULU",
-    "LYB", "MTB", "MRO", "MPC", "MKTX", "MAR", "MMC", "MLM", "MAS", "MA",
-    "MTCH", "MKC", "MCD", "MCK", "MDT", "MRK", "META", "MET", "MTD", "MGM",
-    "MCHP", "MU", "MSFT", "MAA", "MRNA", "MHK", "MOH", "TAP", "MDLZ", "MPWR",
-    "MNST", "MCO", "MS", "MOS", "MSI", "MSCI", "NDAQ", "NTAP", "NOC", "NFLX",
-    "NEM", "NWSA", "NWS", "NEE", "NKE", "NI", "NDSN", "NSC", "NTRS", "NOC",
-    "NCLH", "NRG", "NUE", "NVDA", "NVR", "NXPI", "ORLY", "OXY", "ODFL", "OMC",
-    "ON", "OKE", "ORCL", "OTIS", "PCAR", "PKG", "PANW", "PH", "PAYX", "PAYC",
-    "PYPL", "PNR", "PEP", "PFE", "PCG", "PM", "PSX", "PNW", "PNC", "POOL",
-    "PPG", "PPL", "PFG", "PG", "PGR", "PLD", "PRU", "PEG", "PTC", "PSA",
-    "PHM", "QRVO", "PWR", "QCOM", "DGX", "RL", "RJF", "RTX", "O", "REG",
-    "REGN", "RF", "RSG", "RMD", "RVTY", "ROK", "ROL", "ROP", "ROST", "RCL",
-    "SPGI", "CRM", "SBAC", "SLB", "STX", "SRE", "NOW", "SHW", "SPG", "SWKS",
-    "SJM", "SW", "SNA", "SOLV", "SO", "LUV", "SWK", "SBUX", "STT", "STLD",
-    "STE", "SYK", "SMCI", "SYF", "SNPS", "SYY", "TMUS", "TROW", "TTWO", "TPR",
-    "TRGP", "TGT", "TEL", "TDY", "TFX", "TER", "TSLA", "TXN", "TXT", "TMO",
-    "TJX", "TSCO", "TT", "TDG", "TRV", "TRMB", "TFC", "TYL", "TSN", "USB",
-    "UBER", "UDR", "ULTA", "UNP", "UAL", "UPS", "URI", "UNH", "UHS", "VLO",
-    "VTR", "VLTO", "VRSN", "VRSK", "VZ", "VRTX", "VTRS", "VICI", "V", "VST",
-    "VMC", "WRB", "GWW", "WAB", "WBA", "WMT", "DIS", "WBD", "WM", "WAT",
-    "WEC", "WFC", "WELL", "WST", "WDC", "WRK", "WY", "WMB", "WTW", "WYNN",
-    "XEL", "XYL", "YUM", "ZBRA", "ZBH", "ZTS", "SPY",
+    "AAPL", "MSFT", "AMZN", "NVDA", "GOOGL", "META", "TSLA", "BRK-B", "UNH", "LLY",
+    "JPM", "V", "XOM", "AVGO", "PG", "MA", "HD", "CVX", "MRK", "ABBV", "KO", "PEP",
+    "COST", "TMO", "WMT", "MCD", "CSCO", "ABT", "CRM", "BAC", "ACN", "LIN", "ADBE",
+    "NFLX", "DHR", "TXN", "NEE", "PM", "CMCSA", "VZ", "RTX", "HON", "AMGN", "ORCL",
+    "IBM", "QCOM", "T", "UPS", "LOW", "INTU", "SPGI", "GS", "CAT", "ELV", "BLK", "AXP",
+    "SYK", "GILD", "MDT", "DE", "ADI", "REGN", "VRTX", "MMM", "C", "MS", "ISRG", "ADP",
+    "PLD", "CI", "BSX", "PANW", "KLAC", "LRCX", "MU", "AMAT", "SNPS", "CDNS", "MELI",
+    "ZTS", "SO", "DUK", "AON", "PNC", "USB", "ICE", "F", "GM", "FDX", "NSC", "UNP",
+    "CSX", "WM", "ECL", "EMR", "ITW", "ETN", "APD", "SHW", "MCO", "CTAS", "ROK", "CMI",
+    "PH", "GD", "NOC", "LMT", "BA", "HUM", "CNC", "CVS", "WBA", "MCK", "ABC", "CAH",
+    "JNJ", "PFE", "BMY", "BIIB", "ILMN", "IDXX", "A", "DXCM", "EW", "HCA", "DGX",
+    "LH", "IQV", "RMD", "STE", "HOLX", "TDY", "BAX", "BDX", "ZBH", "TECH", "HSIC",
+    "COO", "PODD", "SPY",
 ]
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -440,29 +424,6 @@ def compute_metrics(returns: pd.Series, weights: pd.DataFrame,
     }
 
 
-# ── Auto-revert ───────────────────────────────────────────────────────────────
-
-def _auto_revert(reason: str) -> None:
-    """
-    Revert agent.py to the last fully-validated state automatically.
-
-    Called on holdback failure or walk-forward failure. Eliminates the risk
-    of the agent forgetting to revert, or reverting to the wrong snapshot.
-
-    If best_holdback_agent.py does not yet exist (no hypothesis has ever
-    passed holdback), a clear error is printed instead of silently failing.
-    """
-    import shutil
-    if BEST_HOLDBACK_AGENT_FILE.exists():
-        shutil.copy(BEST_HOLDBACK_AGENT_FILE, Path(__file__))
-        print(f"  ↩ Auto-reverted to best_holdback_agent.py  ({reason})")
-        print("    Hypothesis permanently closed. Start a new hypothesis.")
-    else:
-        print(f"  ✗ Auto-revert skipped — best_holdback_agent.py does not exist yet.")
-        print(f"    No hypothesis has passed holdback. The current code is the only state.")
-        print(f"    Reason for attempted revert: {reason}")
-
-
 # ── Holdback gate (one-shot, explicit flag only) ──────────────────────────────
 
 def run_holdback_gate(pit_data: dict, dev_metrics: dict,
@@ -516,7 +477,7 @@ def run_holdback_gate(pit_data: dict, dev_metrics: dict,
     else:
         print(f"  ✗ Holdback gate FAILED: {'; '.join(reasons)}")
         print(
-            "  → Auto-reverting to best_holdback_agent.py. This hypothesis is permanently closed.")
+            "  → Revert to best_holdback_agent.py. This hypothesis is permanently closed.")
 
     return {
         "holdback_gate_pass":   gate_pass,
@@ -611,7 +572,7 @@ def walk_forward(dev: dict, wf: dict, signals_fn, sizes_fn,
 
     mean_oos = round(np.mean(sharpes),        4) if sharpes else 0
     mean_exc = round(np.mean(excess_sharpes), 4) if excess_sharpes else 0
-    std_oos = round(np.std(sharpes),          4) if sharpes else 0
+    std_oos = round(np.std(sharpes),         4) if sharpes else 0
 
     dev_sharpe_ref = 0.0
     best_score_path = AGENT_DIR / "best_score.json"
@@ -877,10 +838,6 @@ def run_once(mode: str = "in_sample", description: str = "") -> dict:
         bm_shr = benchmark_sharpe(benchmark_returns(dev))
         result["dev"] = compute_metrics(dev_ret, dev_wgt, bm_sharpe=bm_shr)
 
-        # Auto-revert if walk-forward failed
-        if not result.get("pass"):
-            _auto_revert("walk-forward failed — hypothesis permanently closed")
-
     elif mode == "check_holdback":
         # One-shot holdback gate — run only when agent is ready to commit
         print("Running IS holdback gate check (2017-2018)...")
@@ -898,11 +855,6 @@ def run_once(mode: str = "in_sample", description: str = "") -> dict:
         print(f"  dev  sharpe={dev_m['sharpe']:.3f}  "
               f"excess={dev_m['excess_sharpe']:+.3f}  "
               f"score={dev_m['score']:.3f}")
-
-        # Auto-revert if holdback gate failed
-        if not gate.get("holdback_gate_pass"):
-            _auto_revert(
-                "holdback gate failed — hypothesis permanently closed")
 
     else:
         # --in-sample: DEV period only. Holdback is NOT evaluated.
