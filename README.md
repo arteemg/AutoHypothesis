@@ -1,7 +1,5 @@
 # autohypothesis
 
-single-file autonomous quant strategy search.
-
 ## structure
 ```
 agent.py
