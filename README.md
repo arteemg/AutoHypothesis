@@ -5,9 +5,9 @@
  an open-source agentic framework for quantitative finance research
 </div>
 
-<p align="center">
-  <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
-</p>
+<a href="LICENSE-APACHE">
+  <img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License: Apache-2.0" />
+</a>
 
 ## structure
 ```
