@@ -10,6 +10,10 @@
 </a>
 </p>
 
+
+<div align="center">
+  <img src="docs/sample_plot.png" width="120">
+
 ## structure
 ```
 agent.py
