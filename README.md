@@ -12,7 +12,7 @@
 
 
 <div align="center">
-  <img src="docs/sample_plot.png" width="120">
+  <img src="docs/sample_plot.png" width="500">
 
 ## structure
 ```
