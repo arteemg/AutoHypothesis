@@ -87,7 +87,7 @@ score = sharpe
 - Transaction cost: 10bps per rebalance
 - Universe: top 300 stocks by 30-day average dollar volume (selected on IS data only)
 - Execution: 1-day lag on all signals
-- 
+
 ## customizing
 - **Different asset class**: swap the tickers in `SP500_TICKERS` for ETFs, futures, crypto
 - **Different score formula**: edit `compute_metrics()` in the fixed section AND update `program.md`
