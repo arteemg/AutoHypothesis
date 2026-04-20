@@ -94,6 +94,12 @@ score = sharpe
 - **Different split**: change the date constants in the fixed section — this invalidates cross-experiment comparisons
 - **Larger universe**: change `UNIVERSE_SIZE` in the fixed section — this invalidates cross-experiment comparisons
 
+## limitations/what's next
+1. **Survivorship bias**: delisted stocks weren't included in the MVP
+2. **More realistic costs**: 10bps/trade may be optimistic for this universe
+3. **Sharpe discounting for iteration**: The score formula does not penalize for the number of iterations run.
+4. **Walk-forward leakage**: Since the agent can see walk-forward results, some overfitting may occur despite being prompted to generate novel hypotheses. I plan to address this with a dedicated check agent to verify hypothesis novelty.
+
 > **Note:** The expanding window is only structurally meaningful if `get_signals()` 
 > estimates parameters from data. With hardcoded parameters, the three folds reduce 
 > to a single OOS backtest split into thirds.
