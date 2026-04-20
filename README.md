@@ -73,7 +73,7 @@ score = sharpe
 | Development | 2010–2016 | Iterate freely |
 | IS Holdback | 2017–2018 | One-shot gate per hypothesis |
 | Walk-forward | 2019–2021 | One-shot validation per hypothesis |
-| Holdout | 2022–2024 | Locked until final run |
+| Holdout | 2022–present | Locked until final run |
 
 ## stopping criteria
 | Condition | Meaning |
@@ -81,10 +81,17 @@ score = sharpe
 | Walk-forward passes | Target achieved |
 | 200 iterations | Time limit |
 
+## assumptions
+- Transaction cost: 10bps per rebalance
+- Universe: top 300 stocks by 30-day average dollar volume (selected on IS data only)
+- Execution: 1-day lag on all signals
+- 
 ## customizing
 - **Different asset class**: swap the tickers in `SP500_TICKERS` for ETFs, futures, crypto
 - **Different score formula**: edit `compute_metrics()` in the fixed section AND update `program.md`
 - **Different split**: change the date constants in the fixed section — this invalidates cross-experiment comparisons
 - **Larger universe**: change `UNIVERSE_SIZE` in the fixed section — this invalidates cross-experiment comparisons
 
-> ⚠️ Date constants and `UNIVERSE_SIZE` are in the **fixed section** and are intentionally not editable by the agent. Changing them manually will invalidate comparisons across experiments.
+> **Note:** The expanding window is only structurally meaningful if `get_signals()` 
+> estimates parameters from data. With hardcoded parameters, the three folds reduce 
+> to a single OOS backtest split into thirds.
