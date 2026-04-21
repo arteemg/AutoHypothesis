@@ -10,6 +10,9 @@
   <a href="LICENSE-APACHE">
     <img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License: Apache-2.0" />
   </a>
+    <a href="https://discord.gg/9ggSRAFGKQ">
+    <img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2?logo=discord&logoColor=white" alt="Discord" />
+  </a>
 </p>
 
 <div align="center">
